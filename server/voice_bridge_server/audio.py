@@ -1,13 +1,13 @@
 """Structural WAV validation for the provisional mono-PCM upload contract.
 
-``parse_wav`` is a pure function: it inspects the buffered body, returns a
+``parse_wav`` is a pure function. It inspects the buffered body, returns a
 :class:`WavInfo` on success and raises :class:`WavError` on any failure. It never
-writes, logs or mutates state, and it must not leak ``struct.error`` or
+writes, logs or mutates state. It must not leak ``struct.error`` or
 ``IndexError`` for malformed input.
 
-The accepted format is intentionally narrow (provisional, see
-``docs/protocol.md`` §7): little-endian RIFF/WAVE, PCM format tag 1, mono, 8 or
-16 bits, 8 kHz-48 kHz. Encoded audio must never be labelled PCM.
+The accepted format is narrow and provisional (see ``docs/protocol.md`` §7):
+little-endian RIFF/WAVE, PCM format tag 1, mono, 8 or 16 bits, 8 kHz-48 kHz.
+Encoded audio must never be labelled PCM.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ from __future__ import annotations
 import math
 import struct
 from dataclasses import dataclass
-from fractions import Fraction
 
 _RIFF = b"RIFF"
 _WAVE = b"WAVE"
@@ -79,29 +78,36 @@ def parse_wav(body: bytes, *, max_duration_seconds: float) -> WavInfo:
         )
 
     total = len(data)
+    # The RIFF chunk size counts every byte after the 8-byte RIFF header. It
+    # must cover at least the 4-byte ``WAVE`` form, and it must not claim bytes
+    # that the body does not contain. A container that is too short, or that
+    # runs past the end of the body, is rejected. Bytes after the declared
+    # container are legal trailing padding and are ignored. Every byte inside
+    # the container is parsed as chunk structure.
+    riff_size = int.from_bytes(data[4:8], "little")
+    container_end = 8 + riff_size
+    if riff_size < 4 or container_end > total:
+        raise WavError(
+            "invalid_wav",
+            "WAV RIFF chunk size is inconsistent with the body length.",
+        )
+
     position = 12
     fmt_payload: bytes | None = None
     data_bytes: int | None = None
 
-    while position < total:
-        if total - position < 8:
-            # Trailing bytes after the data payload are ignored; anything else
-            # is a truncated chunk header.
-            if data_bytes is not None:
-                break
+    while position < container_end:
+        if container_end - position < 8:
             raise WavError("invalid_wav", "WAV chunk header is truncated.")
 
         chunk_id = data[position : position + 4]
         chunk_size = int.from_bytes(data[position + 4 : position + 8], "little")
         payload_start = position + 8
         payload_end = payload_start + chunk_size
-        if payload_end > total:
-            # Bytes after the data payload are ignored, so a malformed trailing
-            # fragment is not structural damage once data has been seen.
-            if data_bytes is not None:
-                break
+        if payload_end > container_end:
             raise WavError(
-                "invalid_wav", "WAV chunk extends beyond the end of the body."
+                "invalid_wav",
+                "WAV chunk extends beyond the end of the RIFF container.",
             )
 
         if chunk_id == _FMT:
@@ -125,19 +131,13 @@ def parse_wav(body: bytes, *, max_duration_seconds: float) -> WavInfo:
                 )
             data_bytes = chunk_size
 
-        position = payload_end + (chunk_size & 1)
-        if position > total:
-            # An odd-sized final payload without its pad byte is tolerated at
-            # EOF; a pad that overruns anywhere else is structural damage.
-            if position == total + 1:
-                position = total
-            elif data_bytes is not None:
-                break
-            else:  # pragma: no cover - unreachable with the checks above
-                raise WavError(
-                    "invalid_wav",
-                    "WAV chunk padding extends beyond the end of the body.",
-                )
+        next_position = payload_end + (chunk_size & 1)
+        if next_position > container_end:
+            # An odd-sized final payload may omit its pad byte at the end of
+            # the container. ``payload_end <= container_end`` limits the gap to
+            # that single byte, so no other byte is skipped here.
+            next_position = container_end
+        position = next_position
 
     if fmt_payload is None:
         raise WavError("invalid_wav", "WAV file has no fmt chunk.")
@@ -189,9 +189,14 @@ def parse_wav(body: bytes, *, max_duration_seconds: float) -> WavInfo:
         )
 
     bytes_per_second = sample_rate * block_align
-    # Exact rational comparison avoids float drift at the boundary: exactly
-    # max_duration_seconds is accepted, one frame more is rejected.
-    if Fraction(data_bytes, bytes_per_second) > Fraction(duration_limit):
+    # Compare by division. ``data_bytes / bytes_per_second`` is correctly
+    # rounded, so a clip of exactly ``max_duration_seconds`` produces the same
+    # double as the configured limit and is accepted. Multiplying
+    # ``limit * bytes_per_second`` instead can round below the true product and
+    # reject that same clip. One frame more is at least 1/48000 s larger, which
+    # is many orders of magnitude beyond the rounding error at these durations,
+    # so it is always rejected.
+    if data_bytes / bytes_per_second > duration_limit:
         raise WavError(
             "duration_exceeds_limit",
             "Recording duration exceeds the configured limit.",

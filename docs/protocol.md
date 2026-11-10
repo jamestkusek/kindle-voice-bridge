@@ -48,7 +48,7 @@ prove intelligibility, correct routing or headset compatibility.
 | Success | `201 Created` + JSON, only after the clip is stored |
 | Retries | None. One attempt per recording. No idempotency key in v1. |
 | Read/delete API | None in v1 (filesystem only) |
-| Retention | **Proposed, pending user approval — see [§9](#9-storage-and-retention--proposed-pending-user-approval)** |
+| Retention | Laptop: **approved** — stored clips stay until manually deleted; incomplete files are cleaned after a failed write. Device (Kindle): **pending** — see [§9](#9-storage-and-retention--laptop-approved-device-pending) |
 
 ---
 
@@ -160,8 +160,10 @@ delete API.
   exactly one ASCII space. Leading/trailing whitespace, extra spaces, tabs, a
   missing token, an empty token, a different scheme (`Basic`, `Token`) or a
   duplicate `Authorization` header all produce `401`.
-- Comparison uses `secrets.compare_digest` over UTF-8 bytes. No prefix matching,
-  no trimming, no case folding of the token itself.
+- Comparison uses `secrets.compare_digest` over ASCII bytes. No prefix matching,
+  no trimming, no case folding of the token itself. The configured token is
+  printable ASCII ([§12.1](#121-voice_bridge_serverconfigsettings)); a non-ASCII
+  token is a startup `ValueError`, so header encoding is never ambiguous.
 - Failure response:
 
 ```http
@@ -200,7 +202,7 @@ on `Content-Length` alone.
 4. If the body is empty (zero bytes, whether declared or streamed), respond `400
    empty_body`.
 5. Only after the full body is buffered is it validated ([§7](#7-wav-validation-provisional))
-   and stored ([§9](#9-storage-and-retention--proposed-pending-user-approval)).
+   and stored ([§9](#9-storage-and-retention--laptop-approved-device-pending)).
    The buffer is never written to disk before validation passes.
 
 Notes:
@@ -224,14 +226,27 @@ with a specific `error.code` and stores nothing.
 
 - `RIFF` little-endian only. `RIFX` (big-endian) and `RF64` are rejected.
 - `WAVE` form.
-- Chunks walked from offset 12. Each chunk header is 8 bytes: 4-byte ASCII ID,
+- **The declared RIFF size is validated.** Bytes 4-7 are a little-endian
+  `uint32` `riff_size` covering the container payload after the size field; it
+  must be at least `4` (the `WAVE` form tag). The container ends at
+  `riff_end = 8 + riff_size`. `riff_end` must be `<= len(body)`: a body shorter
+  than its own declared container is `invalid_wav` (truncated), never silently
+  accepted.
+- Chunks are walked from offset 12 and **only inside the container**
+  (`position < riff_end`). Each chunk header is 8 bytes: 4-byte ASCII ID,
   4-byte little-endian `uint32` size. Payloads are word-aligned: an odd-sized
-  payload is followed by one pad byte that is **not** counted in the size.
+  payload is followed by one pad byte that is **not** counted in the size. A
+  chunk header, payload or pad byte that does not fit entirely inside the
+  container is `invalid_wav`; the walk never reads past `riff_end`.
 - Unknown chunks (`LIST`, `fact`, `cue `, `bext`, ...) are skipped.
 - `fmt ` must appear before `data`. Duplicate `fmt ` or duplicate `data` chunks
   are rejected.
-- Trailing bytes after the `data` payload are ignored (they still count toward
-  the body cap and are preserved in the stored file).
+- **Trailing bytes are tolerated only outside the RIFF container**, i.e. at or
+  after `riff_end`. They are not parsed, are preserved byte-for-byte in the
+  stored file and count toward the body cap. Bytes that lie inside the container
+  are part of the chunk stream: fewer than 8 bytes remaining before `riff_end`
+  is a truncated chunk header and therefore `invalid_wav`, so arbitrary filler
+  after `data` cannot hide inside the declared container.
 
 ### 7.2 Accepted format
 
@@ -245,7 +260,7 @@ with a specific `error.code` and stores nothing.
 | `byte_rate` | must equal `sample_rate * block_align` |
 | `fmt ` chunk size | `>= 16`; bytes beyond 16 are ignored |
 | `data` size | `> 0` and a multiple of `block_align` |
-| `data` size vs body | declared size must not exceed the bytes actually remaining after the data chunk header |
+| `data` size vs container | declared size must not exceed the bytes remaining inside the RIFF container after the `data` chunk header |
 
 Sample values are **not** inspected. A silent or clipping clip is structurally
 valid and is accepted; intelligibility is out of scope for the receiver.
@@ -257,14 +272,25 @@ bytes_per_second = sample_rate * block_align
 duration_seconds = data_bytes / bytes_per_second
 ```
 
-Rejection test uses integer arithmetic to avoid float drift:
+The rejection test compares by **division**, not by multiplication:
 
 ```
-reject if data_bytes > max_duration_seconds * bytes_per_second
+reject if data_bytes / bytes_per_second > max_duration_seconds
 ```
 
-So a clip of exactly `max_duration_seconds` is accepted and one byte more is
-rejected. `duration_seconds` is reported rounded to 3 decimal places.
+Division is correctly rounded, so a clip of exactly `max_duration_seconds`
+produces the same double as the configured limit and is accepted. Multiplying
+`max_duration_seconds * bytes_per_second` instead can round below the true
+product and reject that same clip, so multiplication must not be used.
+
+A clip of exactly `max_duration_seconds` is accepted and one `block_align` frame
+more is rejected. This is normative at decimal boundaries: with
+`max_duration_seconds = 0.3` and 8 kHz/16-bit mono (`block_align = 2`, so
+16,000 bytes/s), a 4,800-byte `data` chunk (0.3 s) is **accepted** and 4,802
+bytes — one frame, i.e. one 2-byte sample, more — is rejected. One frame is at
+least 1/48000 s, which is many orders of magnitude beyond the rounding error at
+these durations, so the one-frame-over case is never accepted by rounding.
+`duration_seconds` is reported rounded to 3 decimal places.
 
 ### 7.4 Error codes for this section
 
@@ -272,7 +298,7 @@ rejected. `duration_seconds` is reported rounded to 3 decimal places.
 |---|---|
 | Body is zero bytes | `empty_body` |
 | Body ends early / client disconnect | `incomplete_body` |
-| Not RIFF/WAVE, chunk overruns body, missing `fmt ` or `data`, `data` before `fmt `, duplicate `fmt `/`data`, `data` size not a multiple of `block_align`, inconsistent `block_align`/`byte_rate`, body shorter than 44 bytes | `invalid_wav` |
+| Not RIFF/WAVE, declared RIFF size larger than the body, chunk header/payload/pad byte overrunning the RIFF container, fewer than 8 bytes left before `riff_end`, missing `fmt ` or `data`, `data` before `fmt `, duplicate `fmt `/`data`, `data` size not a multiple of `block_align`, inconsistent `block_align`/`byte_rate`, body shorter than 44 bytes | `invalid_wav` |
 | Format tag not PCM, extensible, not mono, bits not 8/16, sample rate outside 8 kHz-48 kHz | `unsupported_wav_format` |
 | Duration exceeds the limit | `duration_exceeds_limit` |
 
@@ -399,39 +425,51 @@ method on a known path is reported as such without reading credentials.
 
 ---
 
-## 9. Storage and retention — PROPOSED, PENDING USER APPROVAL
+## 9. Storage and retention — laptop approved, device pending
 
-> **PENDING USER APPROVAL.** The rules below are a *proposal* needed to make the
-> receiver testable. They are **not** an approved retention policy. Until the user
-> explicitly approves them:
+> **Approval status.** The user approved the **laptop-side** rules R1-R5 and R8:
+> a successfully received recording in the explicitly configured storage
+> directory is kept until a human deletes it, and incomplete files are cleaned
+> up after a failed write. A crash can still leave `.incoming-*.part` leftovers;
+> those are incomplete, are never treated as recordings, and are removed
+> manually. `.gitignore` excludes them in any directory.
 >
-> - implementers may build to them, keeping every value configurable;
-> - they must not be described to the user, in the handoff or in `README.md`, as
->   agreed or final;
-> - no test may store real speech from the headset under these rules without the
->   coordinator confirming approval;
-> - if the user changes the policy, only this section and the storage boundary
->   change; the HTTP contract in §3-§8 stays as written.
+> **Device-side (Kindle) retention is NOT approved and remains undecided.** It is
+> not decided whether the uploader keeps or deletes a sample after a failed
+> upload, nor whether a successfully uploaded sample is kept or deleted on the
+> device. R6 records that open question. No implementation may assume either
+> behaviour, and this document must not claim that the Kindle discards a sample.
+>
+> Consequences:
+>
+> - implementers may build to the laptop rules, keeping every value configurable;
+> - device-side retention must not be described as agreed or final anywhere,
+>   including the handoff and `README.md`;
+> - no test may store real speech from the headset unless the coordinator confirms
+>   that the configured laptop storage directory is the intended target;
+> - if the user changes the laptop policy, only this section and the storage
+>   boundary change; the HTTP contract in §3-§8 stays as written.
 
-Proposed rules:
+Rules:
 
-| ID | Proposal |
+| ID | Rule |
 |---|---|
-| R1 | The storage directory is **explicitly configured**. There is no default and no fallback to the working directory. `create_app_from_env` fails at startup if `KVB_STORAGE_DIR` is unset, empty or not a usable directory. |
-| R2 | **No automatic deletion or expiry** in milestone 1. Clips persist until a human deletes them. No TTL, no size-based pruning, no background cleanup task. |
-| R3 | **No read or delete HTTP API.** Access is filesystem-only: play with any WAV player, delete with the file manager. |
-| R4 | **Failed uploads leave no artifacts.** Nothing is written before validation passes. An in-progress temp file is removed on any error. A crash may leave `.incoming-*.part` files; these are **not** cleaned automatically and are deleted manually. |
-| R5 | Filenames are `<id>.wav` only. No client-supplied names, no timestamps from the client, no original filename metadata. |
-| R6 | Client side: after a failed upload the sample is discarded once the error is shown; no automatic retry and no silent retention ([§13](#13-client-kindle-uploader-obligations)). |
-| R7 | The storage directory must be outside any cloud-synced folder (OneDrive, Dropbox, iCloud) and must be excluded from version control. `.gitignore` is owned by another workstream; this document only states the requirement. |
-| R8 | A `201` is an acknowledgement of receipt and structural validity, not evidence of intelligibility. |
+| R1 | **Approved.** The storage directory is **explicitly configured**. There is no default and no fallback to the working directory. `create_app_from_env` fails at startup if `KVB_STORAGE_DIR` is unset, empty or not a usable directory. |
+| R2 | **Approved.** **No automatic deletion or expiry** in milestone 1. A successfully received recording persists in the configured laptop storage directory until a human deletes it. No TTL, no size-based pruning, no background cleanup task. |
+| R3 | **Approved.** **No read or delete HTTP API.** Access is filesystem-only: play with any WAV player, delete with the file manager. |
+| R4 | **Approved.** **Failed uploads leave no artifacts.** Nothing is written before validation passes, and the write procedure unlinks its temp file on any error, so a failed write leaves no `.incoming-*.part` file. A crash between temp-file creation and that unlink can leave `.incoming-*.part` leftovers; these are incomplete, are never valid recordings, are never acknowledged or served, and are removed manually. `.gitignore` excludes `.incoming-*.part` in any directory so they are never committed. |
+| R5 | **Approved.** Filenames are `<id>.wav` only. No client-supplied names, no timestamps from the client, no original filename metadata. |
+| R6 | **PENDING — not approved.** Device-side retention is undecided: whether the Kindle keeps or deletes a sample after a **failed** upload, and whether it keeps or deletes one after a **successful** upload, have not been agreed. The uploader must not delete or retain samples on the device on the strength of this document; no automatic retry and no silent retention until the user approves a device policy ([§13](#13-client-kindle-uploader-obligations)). |
+| R7 | The storage directory must be outside any cloud-synced folder (OneDrive, Dropbox, iCloud) and must be excluded from version control. `.gitignore` excludes the runtime storage directories and `.incoming-*.part`; this document states the requirement only. |
+| R8 | **Approved.** A `201` is an acknowledgement of receipt and structural validity, not evidence of intelligibility. |
 
 Rationale for R1-R3: the first milestone needs to prove delivery and manual
 playback. An expiry policy, a download endpoint or a delete endpoint would each
 add an authenticated surface that has not been reviewed. Manual deletion is the
-smallest policy that satisfies "the user can remove samples".
+smallest policy that satisfies "the user can remove samples", and it is the
+approved laptop policy.
 
-### 9.1 Write procedure (proposed, part of the storage boundary)
+### 9.1 Write procedure (part of the storage boundary)
 
 1. Generate `id` ([§9.2](#92-recording-ids)).
 2. Create a temp file in the **same directory** as the final file, named
@@ -445,7 +483,10 @@ smallest policy that satisfies "the user can remove samples".
 7. `201` only after step 6 returns. On POSIX also fsync the directory
    best-effort; on Windows this is a no-op.
 8. On any failure: close and unlink the temp file (best effort), then `500
-   storage_error`. Never leave a final file behind.
+   storage_error`. Never leave a final file behind. This is the approved cleanup
+   rule: a failed write leaves no `.incoming-*.part` file. Only a crash between
+   step 2 and this unlink can leave one behind; such a leftover is incomplete,
+   is never a valid recording, and is removed manually (R4).
 
 IDs are 128-bit random, so a collision is negligible; the existence check in
 step 5 makes the impossible case fail loudly (`500 storage_error`) instead of
@@ -473,8 +514,9 @@ def new_recording_id(now: datetime | None = None) -> str: ...
 
 Any `OSError` during the write procedure maps to `500 storage_error` with a
 message such as `"Could not store recording."` — no path, no errno text that
-reveals the filesystem layout. The temp file is removed. The client keeps its
-sample only long enough to display the failure (R6).
+reveals the filesystem layout. The temp file is removed. What the client does
+with its own sample after a failure is undecided (R6) and is not part of this
+contract.
 
 ---
 
@@ -565,15 +607,15 @@ Validation, performed in `__post_init__` (frozen dataclass: use
 
 | Field | Rule | On violation |
 |---|---|---|
-| `token` | `str`, non-empty, and contains no ASCII whitespace (space, tab, CR, LF) because it travels in a header. Used verbatim, never trimmed. | `ValueError` |
+| `token` | `str`, non-empty, and **printable ASCII only** (`0x21`-`0x7E`): no whitespace, no control characters, no non-ASCII characters, because it travels in an HTTP header and is compared as ASCII bytes. Used verbatim, never trimmed, never Unicode-normalised, never re-encoded. | `ValueError` |
 | `storage_dir` | Accepts `str` or `os.PathLike`; normalised to `pathlib.Path(value).expanduser().resolve()`. Must not be empty. | `ValueError` |
 | `max_body_bytes` | `int` (not `bool`), `> 0`. | `ValueError` |
 | `max_duration_seconds` | `float`/`int` (not `bool`), finite, `> 0`. | `ValueError` |
 
 `Settings` is pure: it performs **no filesystem access, no environment reads and
 no logging**. Filesystem checks belong to `create_app`. Recommended token
-generation is `secrets.token_urlsafe(32)`; v1 enforces only "non-empty, no
-whitespace" so tests can use short tokens, and `README.md` documents the
+generation is `secrets.token_urlsafe(32)`; v1 enforces only "non-empty, printable
+ASCII" so tests can use short tokens, and `README.md` documents the
 ≥32-character requirement for LAN and remote use.
 
 ### 12.2 `voice_bridge_server.app.create_app`
@@ -592,8 +634,14 @@ def create_app(
   1. `settings.storage_dir` is created if missing (`mkdir(parents=True,
      exist_ok=True)`);
   2. if it exists but is not a directory → `RuntimeError`;
-  3. write a probe file `.kvb-write-probe` in it, then delete it; failure →
-     `RuntimeError` naming the directory and "not writable".
+  3. create a **uniquely named** probe file in it with exclusive creation, write
+     and `fsync` it, then unlink **that** file; failure → `RuntimeError` naming
+     the directory and "not writable". `tempfile.NamedTemporaryFile(dir=...,
+     prefix=".kvb-write-probe-", delete=False)` satisfies this. The probe must
+     never open, truncate, overwrite or delete a pre-existing file: a storage
+     directory that already contains `.kvb-write-probe` (or any other file or
+     recording) is left byte-for-byte unchanged, and the probe name is never
+     reused across starts.
   The probe runs even when a fake `store` is injected, so configuration errors
   surface identically in tests and in production.
 - `store=None` means `LocalFileStore(settings.storage_dir)`.
@@ -622,8 +670,9 @@ Used by uvicorn `--factory`. `environ=None` means `os.environ`.
 - Missing or blank required variable → `RuntimeError` naming the variable only,
   never its value: `"KVB_TOKEN is not set"`, `"KVB_STORAGE_DIR is not set"`.
 - Unparseable number → `RuntimeError` naming the variable and the expected type.
-- Invalid combination (e.g. `max_body_bytes=0`) surfaces as `ValueError` from
-  `Settings`; the factory does not swallow it.
+- Invalid values (e.g. `max_body_bytes=0`, a non-ASCII `KVB_TOKEN`) surface as
+  `ValueError` from `Settings`; the factory does not swallow them, and never
+  re-encodes, trims or drops a token value.
 - No `.env` loading, no config file, no CLI flags in v1 (no `python-dotenv`
   dependency).
 - Example start command, run from `server/` so the package is importable without
@@ -652,7 +701,7 @@ class RecordingStore(Protocol):
         """
 ```
 
-- `LocalFileStore(storage_dir: pathlib.Path)` implements [§9.1](#91-write-procedure-proposed-part-of-the-storage-boundary)
+- `LocalFileStore(storage_dir: pathlib.Path)` implements [§9.1](#91-write-procedure-part-of-the-storage-boundary)
   and is the v1 default.
 - The protocol is the only seam needed for tests: a fake that raises `OSError`
   proves `500 storage_error`; a fake that records arguments proves the app
@@ -681,8 +730,10 @@ The uploader may be implemented independently against this section alone.
    shows an error and the user decides whether to record again; a duplicate may
    then exist. That is accepted in v1 (no idempotency key).
 5. **Timeouts:** bounded, e.g. 5 s connect and 20 s total on the LAN, 30 s total
-   for a remote host (cold starts). On timeout: show an error, discard the
-   sample (R6), do not retry.
+   for a remote host (cold starts). On timeout: show an error and do not retry.
+   Device-side retention after a failure is **undecided** (R6); the uploader must
+   neither delete nor keep the sample on the strength of this document until the
+   user approves a device policy.
 6. **Success:** require `201` **and** a parseable JSON body with a non-empty `id`.
    Show the `id` (or a short suffix) as confirmation. Do not claim success on any
    other status, and do not treat a transport-level "connection closed" as
@@ -701,8 +752,9 @@ The uploader may be implemented independently against this section alone.
    verification, never accept a self-signed certificate, never fall back to HTTP
    automatically.
 10. **Audio:** do not log audio bytes, do not write the sample to persistent
-    storage beyond the agreed retention policy, and do not include book content
-    in the request.
+    device storage beyond whatever retention policy the user approves (device
+    policy currently undecided, R6), and do not include book content in the
+    request.
 11. **Format:** send only bytes that are genuinely PCM WAV per §7. If capture
     yields encoded frames (P1), stop and raise the protocol question instead of
     labelling them PCM.
@@ -786,6 +838,11 @@ loopback uvicorn instance. `parse_wav` may be unit-tested directly.
 | 20 | Two sequential uploads | Distinct IDs, two files |
 | 21 | Captured log output for cases 1, 4, 5 | No token, no audio, no `Authorization` value |
 | 22 | `Settings` validation, env factory | `ValueError` / `RuntimeError` per §12.1, §12.3 |
+| 23 | Valid 0.3 s clip with `max_duration_seconds=0.3` | `201`, `duration_seconds == 0.3` (exact decimal boundary accepted) |
+| 24 | 0.3 s + one `block_align` frame with `max_duration_seconds=0.3` | `400 duration_exceeds_limit`, nothing stored |
+| 25 | Declared RIFF size larger than the body; chunk/pad overrunning the container; filler inside the container after `data` | `400 invalid_wav` each; bytes after `riff_end` still accepted |
+| 26 | Storage dir already holds `.kvb-write-probe` and a stored clip; `create_app` runs | Both files unchanged, no probe or temp file left behind |
+| 27 | Non-ASCII `Settings(token=...)` and non-ASCII `KVB_TOKEN` | `ValueError` from `Settings` |
 
 ### 14.4 What these tests do not prove
 
@@ -820,9 +877,11 @@ Flagged for the hardware workstream; each answer may require a protocol revision
 7. **Client HTTP capability.** Confirm the Kindle runtime can send a fixed
    `Content-Length` and set headers; if only chunked is available, §6 already
    supports it.
-8. **Retention approval.** R1-R8 are pending user approval; the hardware
-   workstream must not assume clips may be retained indefinitely on the device or
-   the laptop.
+8. **Retention approval.** Laptop retention is approved: a stored clip stays in
+   the configured storage directory until a human deletes it, and incomplete
+   files are cleaned after a failed write. **Device-side retention is undecided**
+   (R6): the hardware workstream must not assume the Kindle keeps or deletes a
+   sample after a failed or successful upload.
 
 ---
 
@@ -834,6 +893,6 @@ Flagged for the hardware workstream; each answer may require a protocol revision
   `error.code` values for new conditions, new optional environment variables.
 - Breaking changes (path, auth scheme, content type, required fields, status
   semantics) require a new path version (`/v2/...`), not a silent edit.
-- Provisional items P1-P6 and the pending retention policy (§9) are expected to
-  change after hardware work; the HTTP envelope around them is intended to stay
-  stable.
+- Provisional items P1-P6 and the **device-side** retention policy (§9, R6) are
+  expected to change after hardware work; the approved laptop retention rules and
+  the HTTP envelope around them are intended to stay stable.

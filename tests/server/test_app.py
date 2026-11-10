@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import hashlib
 import json
 import logging
 import pathlib
 import re
+import shutil
 import struct
+import subprocess
 from datetime import datetime
 
 import pytest
@@ -24,102 +27,25 @@ from fastapi.testclient import TestClient
 from voice_bridge_server.app import create_app, create_app_from_env
 from voice_bridge_server.config import Settings
 
+# Shared RIFF/WAVE builders.  Under pytest's default "prepend" mode these
+# modules are imported top-level, so the relative import fails and the absolute
+# one finds ``_wav_builders`` on the ``tests/server`` entry pytest adds.
+try:  # pragma: no cover - branch depends on the pytest import mode
+    from . import _wav_builders
+except ImportError:  # pragma: no cover
+    import _wav_builders
+
+_chunk = _wav_builders.chunk
+_fmt_payload = _wav_builders.fmt_payload
+_riff = _wav_builders.riff
+_extensible_fmt = _wav_builders.extensible_fmt
+
+# This suite only needs a body that parses, so 100 frames is enough.
+_wav = functools.partial(_wav_builders.build_wav, frames=100)
+
 TOKEN = "test-token-0123456789abcdef"
 URL = "/v1/recordings"
 RECORDING_ID_RE = re.compile(r"^rec_[0-9]{8}T[0-9]{6}Z_[0-9a-f]{32}$")
-
-
-# ---------------------------------------------------------------------------
-# WAV builders (standard library only)
-# ---------------------------------------------------------------------------
-
-
-def _chunk(chunk_id: bytes, payload: bytes) -> bytes:
-    if len(chunk_id) != 4:
-        raise ValueError("chunk id must be four bytes")
-    padding = b"\x00" if len(payload) % 2 else b""
-    return chunk_id + struct.pack("<I", len(payload)) + payload + padding
-
-
-def _fmt_payload(
-    *,
-    rate: int = 8000,
-    bits: int = 16,
-    channels: int = 1,
-    audio_format: int = 1,
-    block_align: int | None = None,
-    byte_rate: int | None = None,
-    extra: bytes = b"",
-) -> bytes:
-    align = channels * bits // 8 if block_align is None else block_align
-    computed_byte_rate = rate * align if byte_rate is None else byte_rate
-    return (
-        struct.pack(
-            "<HHIIHH",
-            audio_format,
-            channels,
-            rate,
-            computed_byte_rate,
-            align,
-            bits,
-        )
-        + extra
-    )
-
-
-def _riff(
-    chunks: list[bytes],
-    *,
-    riff: bytes = b"RIFF",
-    wave_form: bytes = b"WAVE",
-    riff_size: int | None = None,
-) -> bytes:
-    payload = wave_form + b"".join(chunks)
-    size = len(payload) if riff_size is None else riff_size
-    return riff + struct.pack("<I", size) + payload
-
-
-def _wav(
-    *,
-    rate: int = 8000,
-    bits: int = 16,
-    channels: int = 1,
-    frames: int = 100,
-    data: bytes | None = None,
-    audio_format: int = 1,
-    extra_chunks: tuple[bytes, ...] = (),
-    fmt_extra: bytes = b"",
-    block_align: int | None = None,
-    byte_rate: int | None = None,
-    trailing: bytes = b"",
-) -> bytes:
-    align = channels * bits // 8 if block_align is None else block_align
-    if data is None:
-        data = b"\x00" * (frames * align)
-    fmt = _fmt_payload(
-        rate=rate,
-        bits=bits,
-        channels=channels,
-        audio_format=audio_format,
-        block_align=block_align,
-        byte_rate=byte_rate,
-        extra=fmt_extra,
-    )
-    chunks = [_chunk(b"fmt ", fmt), *extra_chunks, _chunk(b"data", data)]
-    return _riff(chunks) + trailing
-
-
-def _extensible_fmt() -> bytes:
-    pcm_subformat = (
-        b"\x01\x00\x00\x00\x00\x00\x10\x00\x80\x00\x00\xaa\x00\x38\x9b\x71"
-    )
-    extra = (
-        struct.pack("<H", 22)
-        + struct.pack("<H", 16)
-        + struct.pack("<I", 0)
-        + pcm_subformat
-    )
-    return _fmt_payload(audio_format=0xFFFE, extra=extra)
 
 
 def _headers(
@@ -356,7 +282,27 @@ def test_create_app_creates_storage_and_removes_the_probe(
     create_app(Settings(token=TOKEN, storage_dir=storage))
 
     assert storage.is_dir()
-    assert not (storage / ".kvb-write-probe").exists()
+    # The writability probe is removed, leaving the directory empty.
+    assert list(storage.iterdir()) == []
+
+
+def test_create_app_leaves_existing_files_untouched_and_removes_its_probe(
+    tmp_path: pathlib.Path,
+) -> None:
+    storage = tmp_path / "existing"
+    storage.mkdir()
+    existing = storage / ".kvb-write-probe"
+    sentinel = b"pre-existing user file, not a probe"
+    existing.write_bytes(sentinel)
+
+    create_app(Settings(token=TOKEN, storage_dir=storage))
+
+    assert existing.read_bytes() == sentinel
+    # Only the pre-existing file remains: startup's own uniquely named probe
+    # was removed and nothing else was left behind.
+    assert sorted(path.name for path in storage.iterdir()) == [
+        ".kvb-write-probe"
+    ]
 
 
 def test_valid_upload_returns_acknowledgment_and_stores_exact_bytes(
@@ -857,6 +803,39 @@ def test_one_frame_over_fifteen_seconds_is_rejected(
     _assert_no_artifacts(settings.storage_dir)
 
 
+def test_zero_point_three_second_limit_accepts_exactly_and_rejects_one_frame_over(
+    tmp_path: pathlib.Path,
+) -> None:
+    settings = Settings(
+        token=TOKEN,
+        storage_dir=tmp_path / "limit-0.3",
+        max_duration_seconds=0.3,
+    )
+    app = create_app(settings)
+
+    with TestClient(app) as test_client:
+        accepted = test_client.post(
+            URL,
+            content=_wav(rate=8000, bits=16, frames=2400),
+            headers=_headers(),
+        )
+        rejected = test_client.post(
+            URL,
+            content=_wav(rate=8000, bits=16, frames=2401),
+            headers=_headers(),
+        )
+
+    assert accepted.status_code == 201
+    assert accepted.json()["duration_seconds"] == 0.3
+    _assert_error(
+        rejected,
+        400,
+        "duration_exceeds_limit",
+        storage_dir=settings.storage_dir,
+    )
+    assert len(_stored_wavs(settings.storage_dir)) == 1
+
+
 def test_custom_duration_limit_is_enforced(tmp_path: pathlib.Path) -> None:
     settings = Settings(
         token=TOKEN,
@@ -932,6 +911,74 @@ def test_settings_defaults_are_pure(tmp_path: pathlib.Path) -> None:
 def test_settings_rejects_invalid_token(tmp_path: pathlib.Path, token: str) -> None:
     with pytest.raises(ValueError):
         Settings(token=token, storage_dir=tmp_path / "recordings")
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "t\u00f6k\u00e9n",
+        "na\u00efve-token",
+        "\u65e5\u672c\u8a9e",
+        "token\u00a0",
+        "token\u2028",
+    ],
+    ids=["latin-1-letters", "diaeresis", "cjk", "nbsp", "line-separator"],
+)
+def test_settings_rejects_non_ascii_token(
+    tmp_path: pathlib.Path, token: str
+) -> None:
+    with pytest.raises(ValueError):
+        Settings(token=token, storage_dir=tmp_path / "recordings")
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "tok\x00en",
+        "tok\x01en",
+        "tok\x07en",
+        "tok\x08en",
+        "tok\x0ben",
+        "tok\x0cen",
+        "tok\x1fen",
+        "tok\x7fen",
+    ],
+    ids=[
+        "nul",
+        "start-of-heading",
+        "bell",
+        "backspace",
+        "vertical-tab",
+        "form-feed",
+        "unit-separator",
+        "delete",
+    ],
+)
+def test_settings_rejects_token_with_control_characters(
+    tmp_path: pathlib.Path, token: str
+) -> None:
+    """Control bytes below 0x21 and DEL 0x7F cannot travel in a header value.
+
+    Every case here is ASCII and none of them is ASCII whitespace, so the
+    printable-ASCII rule is the one that must reject the token.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        Settings(token=token, storage_dir=tmp_path / "recordings")
+
+    assert "printable" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["!", "~", "!~", "AZaz09-_.~!$&'()*+,;="],
+    ids=["lowest-printable", "highest-printable", "both-bounds", "typical"],
+)
+def test_settings_accepts_printable_ascii_token(
+    tmp_path: pathlib.Path, token: str
+) -> None:
+    settings = Settings(token=token, storage_dir=tmp_path / "recordings")
+
+    assert settings.token == token
 
 
 def test_settings_rejects_empty_storage_dir() -> None:
@@ -1199,3 +1246,44 @@ def test_unknown_path_is_404(client: TestClient) -> None:
     response = client.get("/not-a-route")
 
     _assert_error(response, 404, "not_found")
+
+
+def test_healthz_trailing_slash_is_404_not_a_redirect(
+    client: TestClient,
+) -> None:
+    response = client.get("/healthz/", follow_redirects=False)
+
+    assert response.status_code == 404
+    _assert_error(response, 404, "not_found")
+
+
+# ---------------------------------------------------------------------------
+# Repository hygiene
+# ---------------------------------------------------------------------------
+
+
+def test_gitignore_covers_incoming_part_files_in_alternate_directories() -> None:
+    repo_root = pathlib.Path(__file__).resolve().parents[2]
+    if shutil.which("git") is None:
+        pytest.skip("git is not available")
+    if not (repo_root / ".git").exists():
+        pytest.skip("tests are not running inside a git checkout")
+
+    relative = pathlib.PurePosixPath(
+        "scratch", "alt-dir", ".incoming-0123456789abcdef.part"
+    )
+    candidate = repo_root.joinpath(*relative.parts)
+    # ``git check-ignore`` matches path names without touching the working
+    # tree, so this check never creates or mutates a repository file.
+    assert not candidate.exists()
+
+    completed = subprocess.run(
+        ["git", "check-ignore", "--no-index", "-q", "--", relative.as_posix()],
+        cwd=repo_root,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, (
+        f".gitignore does not cover {relative.as_posix()}"
+    )

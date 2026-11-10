@@ -7,6 +7,7 @@ WAV rules can be checked without the HTTP layer.
 
 from __future__ import annotations
 
+import functools
 import io
 import math
 import random
@@ -17,97 +18,23 @@ import pytest
 
 from voice_bridge_server.audio import WavError, WavInfo, parse_wav
 
+# Shared RIFF/WAVE builders.  Under pytest's default "prepend" mode these
+# modules are imported top-level, so the relative import fails and the absolute
+# one finds ``_wav_builders`` on the ``tests/server`` entry pytest adds.
+try:  # pragma: no cover - branch depends on the pytest import mode
+    from . import _wav_builders
+except ImportError:  # pragma: no cover
+    import _wav_builders
+
+_chunk = _wav_builders.chunk
+_fmt_payload = _wav_builders.fmt_payload
+_riff = _wav_builders.riff
+_extensible_fmt = _wav_builders.extensible_fmt
+
+# 8000 frames is 1 s at 8 kHz, the parser suite's normal body.
+_wav = functools.partial(_wav_builders.build_wav, frames=8000)
+
 MAX_DURATION_SECONDS = 15.0
-
-
-def _chunk(chunk_id: bytes, payload: bytes) -> bytes:
-    """Build one RIFF chunk, including the pad byte for odd payloads."""
-    if len(chunk_id) != 4:
-        raise ValueError("chunk id must be four bytes")
-    padding = b"\x00" if len(payload) % 2 else b""
-    return chunk_id + struct.pack("<I", len(payload)) + payload + padding
-
-
-def _fmt_payload(
-    *,
-    rate: int = 8000,
-    bits: int = 16,
-    channels: int = 1,
-    audio_format: int = 1,
-    block_align: int | None = None,
-    byte_rate: int | None = None,
-    extra: bytes = b"",
-) -> bytes:
-    align = channels * bits // 8 if block_align is None else block_align
-    computed_byte_rate = rate * align if byte_rate is None else byte_rate
-    return (
-        struct.pack(
-            "<HHIIHH",
-            audio_format,
-            channels,
-            rate,
-            computed_byte_rate,
-            align,
-            bits,
-        )
-        + extra
-    )
-
-
-def _riff(
-    chunks: list[bytes],
-    *,
-    riff: bytes = b"RIFF",
-    wave_form: bytes = b"WAVE",
-    riff_size: int | None = None,
-) -> bytes:
-    payload = wave_form + b"".join(chunks)
-    size = len(payload) if riff_size is None else riff_size
-    return riff + struct.pack("<I", size) + payload
-
-
-def _wav(
-    *,
-    rate: int = 8000,
-    bits: int = 16,
-    channels: int = 1,
-    frames: int = 8000,
-    data: bytes | None = None,
-    audio_format: int = 1,
-    extra_chunks: tuple[bytes, ...] = (),
-    fmt_extra: bytes = b"",
-    block_align: int | None = None,
-    byte_rate: int | None = None,
-    trailing: bytes = b"",
-) -> bytes:
-    align = channels * bits // 8 if block_align is None else block_align
-    if data is None:
-        data = b"\x00" * (frames * align)
-    fmt = _fmt_payload(
-        rate=rate,
-        bits=bits,
-        channels=channels,
-        audio_format=audio_format,
-        block_align=block_align,
-        byte_rate=byte_rate,
-        extra=fmt_extra,
-    )
-    chunks = [_chunk(b"fmt ", fmt), *extra_chunks, _chunk(b"data", data)]
-    return _riff(chunks) + trailing
-
-
-def _extensible_fmt() -> bytes:
-    """A 40-byte WAVE_FORMAT_EXTENSIBLE fmt chunk whose subformat is PCM."""
-    pcm_subformat = (
-        b"\x01\x00\x00\x00\x00\x00\x10\x00\x80\x00\x00\xaa\x00\x38\x9b\x71"
-    )
-    extra = (
-        struct.pack("<H", 22)
-        + struct.pack("<H", 16)
-        + struct.pack("<I", 0)
-        + pcm_subformat
-    )
-    return _fmt_payload(audio_format=0xFFFE, extra=extra)
 
 
 def _stdlib_wav(
@@ -312,6 +239,69 @@ def test_accepts_unknown_chunks_and_trailing_bytes() -> None:
     assert info.data_bytes == 20
 
 
+def test_accepts_a_legitimate_wav_with_a_consistent_riff_size() -> None:
+    body = _wav(frames=10)
+
+    assert struct.unpack("<I", body[4:8])[0] == len(body) - 8
+    info = parse_wav(body, max_duration_seconds=MAX_DURATION_SECONDS)
+
+    assert info.data_bytes == 20
+
+
+def test_rejects_riff_size_claiming_bytes_beyond_the_body() -> None:
+    body = _wav(frames=10)
+    overstated = body[:4] + struct.pack("<I", len(body) - 8 + 64) + body[8:]
+
+    with pytest.raises(WavError) as excinfo:
+        parse_wav(overstated, max_duration_seconds=MAX_DURATION_SECONDS)
+
+    assert excinfo.value.code == "invalid_wav"
+
+
+def _riff_size_omitting_required_chunks() -> list[tuple[str, bytes]]:
+    fmt_chunk = _chunk(b"fmt ", _fmt_payload())
+    data_chunk = _chunk(b"data", b"\x00" * 16)
+    return [
+        (
+            "container-ends-before-fmt",
+            _riff([fmt_chunk, data_chunk], riff_size=4),
+        ),
+        (
+            "container-ends-before-data",
+            _riff([fmt_chunk, data_chunk], riff_size=4 + len(fmt_chunk)),
+        ),
+    ]
+
+
+RIFF_SIZE_OMITTING_REQUIRED_CHUNKS = _riff_size_omitting_required_chunks()
+
+
+@pytest.mark.parametrize(
+    "name,body",
+    RIFF_SIZE_OMITTING_REQUIRED_CHUNKS,
+    ids=[name for name, _ in RIFF_SIZE_OMITTING_REQUIRED_CHUNKS],
+)
+def test_rejects_riff_size_that_omits_required_chunks(
+    name: str, body: bytes
+) -> None:
+    with pytest.raises(WavError) as excinfo:
+        parse_wav(body, max_duration_seconds=MAX_DURATION_SECONDS)
+
+    assert excinfo.value.code == "invalid_wav"
+
+
+def test_rejects_a_truncated_duplicate_chunk_inside_the_declared_container() -> None:
+    fmt_chunk = _chunk(b"fmt ", _fmt_payload())
+    data_chunk = _chunk(b"data", b"\x00" * 16)
+    truncated_duplicate = b"fmt " + struct.pack("<I", 1000) + b"\x00" * 10
+    body = _riff([fmt_chunk, data_chunk, truncated_duplicate])
+
+    with pytest.raises(WavError) as excinfo:
+        parse_wav(body, max_duration_seconds=MAX_DURATION_SECONDS)
+
+    assert excinfo.value.code == "invalid_wav"
+
+
 def test_accepts_fmt_chunk_larger_than_sixteen_bytes() -> None:
     body = _wav(frames=10, fmt_extra=b"\x00\x00")
 
@@ -345,6 +335,24 @@ def test_rejects_one_frame_over_fifteen_seconds() -> None:
 
     with pytest.raises(WavError) as excinfo:
         parse_wav(body, max_duration_seconds=MAX_DURATION_SECONDS)
+
+    assert excinfo.value.code == "duration_exceeds_limit"
+
+
+def test_accepts_exactly_zero_point_three_seconds_at_the_configured_limit() -> None:
+    body = _wav(rate=8000, bits=16, frames=2400)
+
+    info = parse_wav(body, max_duration_seconds=0.3)
+
+    assert info.data_bytes == 4800
+    assert info.duration_seconds == 0.3
+
+
+def test_rejects_one_frame_over_zero_point_three_seconds() -> None:
+    body = _wav(rate=8000, bits=16, frames=2401)
+
+    with pytest.raises(WavError) as excinfo:
+        parse_wav(body, max_duration_seconds=0.3)
 
     assert excinfo.value.code == "duration_exceeds_limit"
 

@@ -1,8 +1,8 @@
 """Immutable receiver configuration.
 
-``Settings`` is deliberately pure: it validates and normalises values but never
-touches the filesystem, reads the environment or logs. Filesystem checks belong
-to :func:`voice_bridge_server.app.create_app`.
+``Settings`` validates and normalises values only. It does not touch the
+filesystem, read the environment or log. Filesystem checks belong to
+:func:`voice_bridge_server.app.create_app`.
 """
 
 from __future__ import annotations
@@ -19,8 +19,8 @@ _ASCII_WHITESPACE = frozenset(" \t\r\n")
 class Settings:
     """Validated receiver settings.
 
-    ``storage_dir`` accepts a ``str`` or ``os.PathLike`` and is normalised to an
-    absolute, expanded :class:`pathlib.Path`.
+    ``storage_dir`` accepts a ``str`` or ``os.PathLike``. The field is
+    normalised to an absolute, expanded :class:`pathlib.Path`.
     """
 
     token: str
@@ -34,7 +34,17 @@ class Settings:
             raise ValueError("token must be a non-empty string")
         if any(character in _ASCII_WHITESPACE for character in token):
             raise ValueError("token must not contain ASCII whitespace")
-        object.__setattr__(self, "token", token)
+        # The client sends the bearer token in an HTTP header, so only ASCII is
+        # transport-safe. This check keeps every accepted token byte-for-byte
+        # comparable with the value the client sent.
+        if not token.isascii():
+            raise ValueError("token must contain only ASCII characters")
+        # An HTTP header value cannot carry control characters. Limit the token
+        # to printable ASCII (0x21-0x7E) so the documented contract holds.
+        if any(not 0x21 <= ord(character) <= 0x7E for character in token):
+            raise ValueError(
+                "token must contain only printable ASCII characters (0x21-0x7E)"
+            )
 
         raw_storage_dir = self.storage_dir
         if not isinstance(raw_storage_dir, (str, os.PathLike)):
@@ -58,7 +68,6 @@ class Settings:
             raise ValueError("max_body_bytes must be an integer")
         if max_body_bytes <= 0:
             raise ValueError("max_body_bytes must be greater than zero")
-        object.__setattr__(self, "max_body_bytes", max_body_bytes)
 
         max_duration_seconds = self.max_duration_seconds
         if isinstance(max_duration_seconds, bool) or not isinstance(

@@ -1,12 +1,13 @@
 """FastAPI application for the Kindle voice-bridge receiver.
 
-The app implements the v1 contract in ``docs/protocol.md``: one authenticated
-upload endpoint, an unauthenticated health probe, bounded body reads, structural
-WAV validation and atomic local storage. It never logs the token, the
-``Authorization`` header or audio bytes, and it never retries.
+The app implements the v1 contract in ``docs/protocol.md``. The contract has one
+authenticated upload endpoint and one unauthenticated health probe. The app
+bounds every body read, validates the WAV structure and writes local files
+atomically. It never logs the token, the ``Authorization`` header or audio
+bytes, and it never retries.
 
 Binding and transport (uvicorn ``--host``/``--port``, TLS termination) are
-outside this module. ``create_app`` never reads the environment; use
+outside this module. ``create_app`` never reads the environment. Use
 :func:`create_app_from_env` for the uvicorn factory.
 """
 
@@ -17,6 +18,7 @@ import logging
 import os
 import pathlib
 import secrets
+import tempfile
 from collections.abc import Mapping
 from datetime import datetime, timezone
 
@@ -60,7 +62,7 @@ _HTTP_ERROR_MESSAGES = {
     415: "Unsupported media type.",
     500: "An internal error occurred.",
 }
-_WRITE_PROBE_NAME = ".kvb-write-probe"
+_WRITE_PROBE_PREFIX = ".kvb-write-probe-"
 
 
 def create_app(
@@ -78,11 +80,10 @@ def create_app(
         openapi_url=None,
         docs_url=None,
         redoc_url=None,
+        # The router inherits this, so a POST body is never answered with a
+        # 307 redirect.
         redirect_slashes=False,
     )
-    # ``redirect_slashes`` is also set on the router so POST bodies are never
-    # answered with a 307 redirect, regardless of FastAPI version details.
-    app.router.redirect_slashes = False
 
     app.state.settings = settings
     app.state.store = (
@@ -143,9 +144,9 @@ def create_app_from_env(
 ) -> FastAPI:
     """Build the app from ``KVB_*`` environment variables.
 
-    Used by ``uvicorn --factory``. Missing or blank required variables raise
-    ``RuntimeError`` naming the variable only; invalid values surface as
-    ``ValueError`` from :class:`Settings`.
+    ``uvicorn --factory`` uses this function. A missing or blank required
+    variable raises ``RuntimeError`` that names the variable only. An invalid
+    value raises ``ValueError`` from :class:`Settings`.
     """
 
     env = os.environ if environ is None else environ
@@ -174,7 +175,7 @@ async def _handle_upload(
     settings: Settings,
     store: RecordingStore,
 ) -> Response:
-    # 2. Authentication precedes every body-related check.
+    # 2. Authentication runs before every body check.
     authorization_values = request.headers.getlist("authorization")
     if len(authorization_values) != 1 or not _token_matches(
         authorization_values[0], settings.token
@@ -204,7 +205,7 @@ async def _handle_upload(
             "Content-Type must be audio/wav.",
         )
 
-    # 4. Declared length over the cap is rejected without reading the body.
+    # 4. A declared length over the cap is rejected before the body is read.
     declared_length: int | None = None
     raw_content_length = request.headers.get("content-length")
     if raw_content_length is not None:
@@ -279,7 +280,7 @@ async def _handle_upload(
             400, "invalid_wav", "WAV data could not be parsed."
         )
 
-    # 8. Storage. A 201 is returned only after the write completed.
+    # 8. Storage. The app returns a 201 only after the write completes.
     recording_id = new_recording_id()
     try:
         store.save(recording_id, body)
@@ -388,9 +389,32 @@ def _prepare_storage(storage_dir: pathlib.Path) -> None:
             f"Storage directory {storage_dir} is not a directory."
         )
 
-    probe_path = storage_dir / _WRITE_PROBE_NAME
+    _probe_writable_directory(storage_dir)
+
+
+def _probe_writable_directory(storage_dir: pathlib.Path) -> None:
+    """Prove ``storage_dir`` is writable without touching existing files.
+
+    ``tempfile`` creates the probe under a unique name with exclusive creation,
+    so an existing file is never truncated, overwritten or reused. Only the file
+    this call created is removed.
+    """
+
     try:
-        with open(probe_path, "wb") as handle:
+        handle = tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=storage_dir,
+            prefix=_WRITE_PROBE_PREFIX,
+            delete=False,
+        )
+    except OSError as exc:
+        raise RuntimeError(
+            f"Storage directory {storage_dir} is not writable."
+        ) from exc
+
+    probe_path = pathlib.Path(handle.name)
+    try:
+        with handle:
             handle.write(b"kvb")
             handle.flush()
             os.fsync(handle.fileno())
@@ -401,8 +425,6 @@ def _prepare_storage(storage_dir: pathlib.Path) -> None:
     finally:
         try:
             probe_path.unlink()
-        except FileNotFoundError:
-            pass
         except OSError:
             pass
 

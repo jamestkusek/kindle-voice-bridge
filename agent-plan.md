@@ -75,6 +75,8 @@ Hardware failure or unsupported runtime blocks claims of completion; it is not p
 
 ## Test strategy
 
+**Testing preference (user-approved):** favor focused unit tests and simulated or in-process integration tests. Keep automated end-to-end tests to a minimum. The user prefers to perform end-to-end and hardware acceptance testing personally; any device access requires their specific permission. This preference is not a reason to delete existing tests.
+
 **Unit tests:** use fakes for Bluetooth, timing, capture, upload and restoration. Cover state transitions, duration and memory limits, cancellation, headset disconnect, malformed audio, receiver size limits, timeouts, invalid credentials, TLS failures, upload failure and restoration after exceptions. Verify logs do not contain audio or secrets.
 
 **Integration tests:** generate a sample in memory and exercise the upload/receiver boundary. Verify acknowledgement and content, unauthorized rejection, error handling and retention/deletion. Test the session flow using fake capture. A local integration test does not prove hosted deployment or hardware compatibility.

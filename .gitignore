@@ -48,6 +48,11 @@ pip-wheel-metadata/
 *.s16le
 *.raw
 
+# Partial audio from the atomic temp-file-then-rename write (protocol §9.1).
+# No leading slash: matches in any directory, including storage directories
+# inside the repo, so a crash-leftover partial file is never committed.
+.incoming-*.part
+
 # Checked-in test fixtures are allowed to contain audio samples
 !tests/fixtures/**/*.wav
 !tests/fixtures/**/*.pcm
