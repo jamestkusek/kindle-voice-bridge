@@ -3,17 +3,9 @@
 
 The input is a flat byte stream of signed 16-bit little-endian samples. The
 program removes the DC offset, scales the result to a target peak level, and
-writes a standard PCM WAV file. It refuses to replace an existing file.
-
-Use this program when a capture sits far from zero. A DC offset wastes the
-sample range and makes the clip sound like a click. Removing it does not
-recover audio that the capture never held.
-
-The optional high-pass filter tracks a drifting baseline. Set it below the
-lowest voice pitch that you want to keep. A value of 60 Hz keeps most of a deep
-male fundamental and still removes a slow drift.
-
-Only the Python standard library is used.
+refuses to replace an existing file. Removing an offset does not recover audio
+that the capture never held. The optional high-pass filter tracks a drifting
+baseline; set it below the lowest voice pitch you want to keep.
 """
 
 import argparse

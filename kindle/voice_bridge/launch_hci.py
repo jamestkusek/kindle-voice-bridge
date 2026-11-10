@@ -167,8 +167,6 @@ def start():
         remove_state()
     peer, port, bind = config_and_bind()
     current_boot = boot_id()
-    if process_stat(os.getpid()) is None:
-        raise LauncherError("Cannot read process data. The supervisor did not start.")
     args = [PYTHON, "-B", SUPERVISOR, "--bind", bind, "--peer", peer,
             "--port", str(port), "--authorize-bluetooth-handoff",
             "--acknowledge-plaintext-hci", "--confirm-bluetooth-enabled-in-ui"]

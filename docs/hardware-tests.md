@@ -30,13 +30,15 @@ and `asyncio` modules import successfully. TLS connections remain untested.
 These plugin actions work on the device:
 
 - Run diagnostics
-- Test upload (a generated WAV reached the Windows receiver over Wi-Fi)
 - Inspect Bluetooth
 - Start HCI probe
 - Stop HCI probe
 - Export Bluetooth link keys
 
-The upload path is therefore verified end to end, not only locally.
+The upload path was verified separately: `kindle/voice_bridge/test_upload.py`
+sent a generated WAV to the Windows receiver over Wi-Fi. The plugin no longer
+exposes that test as a menu action; the upload path is verified end to end but
+is not part of the HCI flow.
 
 ## Network direction
 
@@ -78,6 +80,11 @@ Kindle pairing store. The original byte order failed with
 `AUTHENTICATION_FAILURE_ERROR`. Use `tools/kindle_keys_to_bumble.py
 --reverse-key-bytes` for this headset.
 
+The export shape is now confirmed: a `<bt_devices>` root with `<device>`
+elements holding `<bd_addr>`, `<link_key>` and `<key_type>`, with values written
+as colon-separated hex and a trailing colon. The converter parses that shape
+directly and writes both the plain and the `/P` peer key.
+
 ## Captures
 
 Three captures were taken. The raw payload is the HCI SCO data, not a WAV.
@@ -95,8 +102,9 @@ possibly invalid, missing data, or partially lost.
 ## Remaining known issues
 
 - The first ~2.4 s of a capture is a non-speech artifact, likely a stale or
-  unfed SCO receive buffer. Speech starts only after it. Trimming the artifact
-  is not yet automated.
+  unfed SCO receive buffer. Speech starts only after it. Trimming is manual:
+  `tools/clean_raw_wav.py --start 2.4` drops the artifact, but nothing detects
+  the boundary on its own.
 - The laptop's own cleanup sometimes reports a timeout while the Kindle
   restoration still succeeds. The timeout is a report on the laptop side, not
   proof that restoration failed.

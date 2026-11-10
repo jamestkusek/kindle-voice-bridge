@@ -3,14 +3,9 @@
 
 The input is a flat byte stream with no header. The caller states the sample
 rate and the byte order. The program writes a RIFF/WAVE file with 16-bit
-samples and keeps the sample rate that the caller gives. It refuses to replace
-an existing output file.
-
-The program does not prove that the input is audio. A payload that is encoded,
-truncated, or mostly silent still converts without error. Read the analysis
-output before you trust the result.
-
-Only the Python standard library is used.
+samples and refuses to replace an existing output file. It does not prove that
+the input is audio: encoded, truncated, or silent payloads convert without
+error.
 """
 
 import argparse

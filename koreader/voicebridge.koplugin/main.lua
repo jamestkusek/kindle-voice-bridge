@@ -4,23 +4,11 @@ local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local _ = require("gettext")
 
-local log_path = "/mnt/us/kindle-voice-bridge/diagnostics.txt"
-local upload_log_path = "/mnt/us/kindle-voice-bridge/upload-test-result.txt"
-local bluetooth_log_path = "/mnt/us/kindle-voice-bridge/bluetooth-inspection.txt"
+local base_path = "/mnt/us/kindle-voice-bridge"
+local log_path = base_path .. "/diagnostics.txt"
+local bluetooth_log_path = base_path .. "/bluetooth-inspection.txt"
 local end_marker = "\nDiagnostics complete.\n"
 local bluetooth_end_marker = "\nBluetooth inspection complete.\n"
-
-local upload_command = [[
-PYTHONHOME=/mnt/us/kindle-voice-bridge/python31117
-PYTHONNOUSERSITE=1
-PYTHONDONTWRITEBYTECODE=1
-LD_LIBRARY_PATH="$PYTHONHOME/lib"
-SSL_CERT_FILE="$PYTHONHOME/lib/python3.11/site-packages/pip/_vendor/certifi/cacert.pem"
-export PYTHONHOME PYTHONNOUSERSITE PYTHONDONTWRITEBYTECODE LD_LIBRARY_PATH SSL_CERT_FILE
-unset PYTHONPATH PYTHONSTARTUP PYTHONUSERBASE VIRTUAL_ENV
-"$PYTHONHOME/bin/python3.11" -B /mnt/us/kindle-voice-bridge/test_upload.py /mnt/us/kindle-voice-bridge/upload-test.json 2>&1
-printf '\nExit status: %s\n' "$?"
-]]
 
 local hci_command = [[
 PYTHONHOME=/mnt/us/kindle-voice-bridge/python31117
@@ -87,8 +75,7 @@ if [ -f "$runtime" ]; then
         PYTHONNOUSERSITE=1
         PYTHONDONTWRITEBYTECODE=1
         LD_LIBRARY_PATH="$PYTHONHOME/lib"
-        SSL_CERT_FILE="$PYTHONHOME/lib/python3.11/site-packages/pip/_vendor/certifi/cacert.pem"
-        export PYTHONHOME PYTHONNOUSERSITE PYTHONDONTWRITEBYTECODE LD_LIBRARY_PATH SSL_CERT_FILE
+        export PYTHONHOME PYTHONNOUSERSITE PYTHONDONTWRITEBYTECODE LD_LIBRARY_PATH
         ulimit -c 0 2>/dev/null || :
         "$runtime" --version 2>&1
         result=$?
@@ -97,26 +84,8 @@ if [ -f "$runtime" ]; then
             "$runtime" -u -B -c 'import sys; print("Python started", flush=True); import ssl; print("ssl OK", flush=True); import socket; print("socket OK", flush=True); import ctypes; print("ctypes OK", flush=True); import asyncio; print("asyncio OK", flush=True)' 2>&1
             printf 'Import check exit status: %s\n' "$?"
         else
-            printf 'Loader diagnostics, last 40 lines:\n'
-            LD_DEBUG=libs "$runtime" --version 2>&1 | tail -40
-            work=$(mktemp -d /tmp/voicebridge.XXXXXX 2>/dev/null)
-            if [ -n "$work" ] && [ -d "$work" ]; then
-                if cp "$runtime" "$work/python3.11" && chmod 700 "$work/python3.11"; then
-                    printf '\nRuntime copied to temporary storage:\n'
-                    "$work/python3.11" --version 2>&1
-                    printf 'Temporary runtime exit status: %s\n' "$?"
-                    if command -v strace >/dev/null 2>&1; then
-                        strace -o "$work/strace.log" "$work/python3.11" --version >/dev/null 2>&1
-                        printf 'System call trace, last 30 lines:\n'
-                        tail -30 "$work/strace.log"
-                    fi
-                else
-                    printf 'Cannot prepare a temporary runtime.\n'
-                fi
-                rm -rf "$work"
-            else
-                printf 'Cannot create temporary storage for the runtime.\n'
-            fi
+            printf 'Loader diagnostics, last 20 lines:\n'
+            LD_DEBUG=libs "$runtime" --version 2>&1 | tail -20
         fi
     )
 else
@@ -200,14 +169,6 @@ proc_seen=no
 comm_incomplete=no
 fd_incomplete=no
 holder_found=no
-# The final dot preserves trailing newlines in the readlink output.
-expected_target=$(printf '/dev/ttymxc2\n.')
-if command -v readlink >/dev/null 2>&1; then
-    have_readlink=yes
-else
-    have_readlink=no
-    fd_incomplete=yes
-fi
 printf '\nProcesses with a file descriptor pointing exactly to /dev/ttymxc2:\n'
 for proc in /proc/[0-9]*; do
     [ -d "$proc" ] || continue
@@ -227,18 +188,10 @@ for proc in /proc/[0-9]*; do
         name='Process name unavailable.'
         comm_incomplete=yes
     fi
-    if [ "$have_readlink" = no ]; then
-        continue
-    fi
-    fd_dir="$proc/fd"
-    if [ ! -r "$fd_dir" ] || [ ! -x "$fd_dir" ]; then
-        fd_incomplete=yes
-        continue
-    fi
-    for fd in "$fd_dir"/*; do
-        [ "$fd" = "$fd_dir/*" ] && continue
-        if target=$(readlink "$fd" 2>/dev/null && printf '.'); then
-            if [ "$target" = "$expected_target" ]; then
+    for fd in "$proc"/fd/*; do
+        [ -e "$fd" ] || continue
+        if target=$(readlink "$fd" 2>/dev/null); then
+            if [ "$target" = /dev/ttymxc2 ]; then
                 printf '%s\n' "$name"
                 holder_found=yes
                 break
@@ -254,9 +207,6 @@ if [ "$proc_seen" = no ]; then
 fi
 if [ "$holder_found" = no ]; then
     printf 'None found among readable file descriptors.\n'
-fi
-if [ "$have_readlink" = no ]; then
-    printf 'Cannot inspect file descriptors because readlink is unavailable.\n'
 fi
 if [ "$fd_incomplete" = yes ] || [ "$comm_incomplete" = yes ]; then
     printf 'Some process data was unavailable. The results may be incomplete.\n'
@@ -303,6 +253,7 @@ else
         printf 'No rfkill entries found.\n'
     fi
 fi
+
 printf '\nBluetooth proc files:\n'
 for node in /proc/bluetooth/btenable /proc/bluetooth/sleep/proto \
     /proc/bluetooth/sleep/btwake /proc/bluetooth/sleep/asleep \
@@ -337,27 +288,6 @@ elif [ -x /dev ]; then
 else
     printf 'unknown\n'
 fi
-
-printf '\nBundled Python termios constants:\n'
-runtime_home=/mnt/us/kindle-voice-bridge/python31117
-runtime="$runtime_home/bin/python3.11"
-if [ ! -e "$runtime" ]; then
-    printf 'Bundled Python is not present.\n'
-elif [ ! -x "$runtime" ]; then
-    printf 'Bundled Python is not executable.\n'
-elif ! command -v env >/dev/null 2>&1; then
-    printf 'Cannot check constants because env is unavailable.\n'
-else
-    (
-        ulimit -c 0 2>/dev/null || :
-        if constants=$(env -i PYTHONHOME="$runtime_home" LD_LIBRARY_PATH="$runtime_home/lib" \
-            "$runtime" -B -S -c 'import termios; print("termios.B2000000: " + ("yes" if hasattr(termios, "B2000000") else "no")); print("termios.CRTSCTS: " + ("yes" if hasattr(termios, "CRTSCTS") else "no"))' 2>/dev/null); then
-            printf '%s\n' "$constants"
-        else
-            printf 'Cannot check termios constants. Exit status: %s\n' "$?"
-        fi
-    )
-fi
 printf '\nBluetooth inspection complete.\n'
 ]]
 
@@ -365,32 +295,33 @@ local export_keys_command = [[
 exec 2>&1
 keys_source=/var/local/zbluetooth/bt_devices.xml
 keys_target=/mnt/us/kindle-voice-bridge/bt-keys.txt
-keys_dir=/mnt/us/kindle-voice-bridge
-if [ ! -e "$keys_source" ]; then
-    printf 'The Bluetooth device file is not present. No link keys were exported.\n'
-    printf 'File: %s\n' "$keys_source"
-    exit 1
-fi
 if [ ! -r "$keys_source" ]; then
-    printf 'The Bluetooth device file is not readable. No link keys were exported.\n'
-    printf 'File: %s\n' "$keys_source"
+    printf 'Cannot read %s. No link keys were exported.\n' "$keys_source"
     exit 1
 fi
-if [ ! -d "$keys_dir" ] || [ ! -w "$keys_dir" ]; then
-    printf 'The plugin cannot write the link key file. The folder is missing or not writable.\n'
-    printf 'Folder: %s\n' "$keys_dir"
+if ! cat "$keys_source" > "$keys_target"; then
+    printf 'Cannot write %s. Check the folder, the permissions and the free space.\n' "$keys_target"
     exit 1
 fi
-if cat "$keys_source" > "$keys_target"; then
-    printf 'Exported the Bluetooth link keys.\n'
-    printf 'File: %s\n' "$keys_target"
-    printf 'Connect USB storage to copy the file to your computer. Delete the file after the test.\n'
-    exit 0
-fi
-printf 'The plugin cannot write the link key file. Check the free space and the file permissions.\n'
-printf 'File: %s\n' "$keys_target"
-exit 1
+printf 'Exported the Bluetooth link keys to %s.\n' "$keys_target"
+printf 'Connect USB storage to copy the file to your computer. Delete the file after the test.\n'
 ]]
+
+local function run(command)
+    local pipe = io.popen(command, "r")
+    if not pipe then return nil end
+    local read_ok, text = pcall(pipe.read, pipe, "*a")
+    pcall(pipe.close, pipe)
+    if read_ok then return text end
+end
+
+local function save(path, text)
+    local file = io.open(path, "w")
+    if not file then return false end
+    local written = file:write(text)
+    local closed = file:close()
+    return written and closed
+end
 
 local VoiceBridge = WidgetContainer:extend{
     name = "voicebridge",
@@ -402,28 +333,13 @@ function VoiceBridge:init()
 end
 
 function VoiceBridge:runDiagnostics()
-    local ok, output = pcall(function()
-        local pipe = io.popen(diagnostics_command, "r")
-        if not pipe then return nil end
-        local read_ok, text = pcall(pipe.read, pipe, "*a")
-        pcall(pipe.close, pipe)
-        if read_ok then return text end
-    end)
-    local complete = ok and output and output:sub(-#end_marker) == end_marker
+    local output = run(diagnostics_command) or ""
+    local complete = output:sub(-#end_marker) == end_marker
     if not complete then
-        output = (ok and output or "") .. "\nCould not complete diagnostics.\n"
+        output = output .. "\nCould not complete diagnostics.\n"
     end
-
-    local write_ok, saved = pcall(function()
-        local file = io.open(log_path, "w")
-        if not file then return false end
-        local written = file:write(output)
-        local closed = file:close()
-        return written and closed
-    end)
-
     local message
-    if not write_ok or not saved then
+    if not save(log_path, output) then
         message = _("The plugin cannot write diagnostics.txt. Check that /mnt/us/kindle-voice-bridge exists and is writable. Check the free space.")
     elseif not complete then
         message = _("Diagnostics did not finish. The plugin saved the log. Reconnect USB storage. Open kindle-voice-bridge/diagnostics.txt on your computer.")
@@ -433,52 +349,14 @@ function VoiceBridge:runDiagnostics()
     UIManager:show(InfoMessage:new{ text = message })
 end
 
-function VoiceBridge:runUploadTest()
-    local ok, output = pcall(function()
-        local pipe = io.popen(upload_command, "r")
-        if not pipe then return nil end
-        local read_ok, text = pcall(pipe.read, pipe, "*a")
-        pcall(pipe.close, pipe)
-        if read_ok then return text end
-    end)
-    if not ok or not output then
-        output = _("The upload test could not start.")
-    end
-    local saved = pcall(function()
-        local file = assert(io.open(upload_log_path, "w"))
-        assert(file:write(output))
-        assert(file:close())
-    end)
-    local message = output
-    if saved then
-        message = message .. _("\nReconnect USB storage to read upload-test-result.txt.")
-    else
-        message = message .. _("\nThe plugin could not save upload-test-result.txt.")
-    end
-    UIManager:show(InfoMessage:new{ text = message })
-end
-
 function VoiceBridge:inspectBluetooth()
-    local ok, output = pcall(function()
-        local pipe = io.popen(bluetooth_command, "r")
-        if not pipe then return nil end
-        local read_ok, text = pcall(pipe.read, pipe, "*a")
-        pcall(pipe.close, pipe)
-        if read_ok then return text end
-    end)
-    local complete = ok and output and output:sub(-#bluetooth_end_marker) == bluetooth_end_marker
+    local output = run(bluetooth_command) or ""
+    local complete = output:sub(-#bluetooth_end_marker) == bluetooth_end_marker
     if not complete then
-        output = (ok and output or "") .. "\nBluetooth inspection did not finish.\n"
+        output = output .. "\nBluetooth inspection did not finish.\n"
     end
-    local write_ok, saved = pcall(function()
-        local file = io.open(bluetooth_log_path, "w")
-        if not file then return false end
-        local written = file:write(output)
-        local closed = file:close()
-        return written and closed
-    end)
     local message
-    if not write_ok or not saved then
+    if not save(bluetooth_log_path, output) then
         message = _("The plugin cannot save bluetooth-inspection.txt. Check that /mnt/us/kindle-voice-bridge exists and is writable. Check the free space.")
     elseif not complete then
         message = _("The Bluetooth inspection did not finish. The plugin saved a partial report. Restart KOReader and try again.")
@@ -489,14 +367,8 @@ function VoiceBridge:inspectBluetooth()
 end
 
 function VoiceBridge:exportBluetoothKeys()
-    local ok, output = pcall(function()
-        local pipe = io.popen(export_keys_command, "r")
-        if not pipe then return nil end
-        local read_ok, text = pcall(pipe.read, pipe, "*a")
-        pcall(pipe.close, pipe)
-        if read_ok then return text end
-    end)
-    if not ok or not output or output == "" then
+    local output = run(export_keys_command)
+    if not output or output == "" then
         output = _("The export did not start. Check that /mnt/us/kindle-voice-bridge exists and is writable.")
     end
     UIManager:show(InfoMessage:new{ text = output })
@@ -515,14 +387,8 @@ function VoiceBridge:runHciCommand(action)
     local command = hci_command:gsub("\n$", "") .. " " .. arguments .. [[ 2>&1
 printf '\nExit status: %s\n' "$?"
 ]]
-    local ok, output = pcall(function()
-        local pipe = io.popen(command, "r")
-        if not pipe then return nil end
-        local read_ok, text = pcall(pipe.read, pipe, "*a")
-        pcall(pipe.close, pipe)
-        if read_ok then return text end
-    end)
-    if not ok or not output then
+    local output = run(command)
+    if not output then
         output = _("The HCI launcher could not start.")
     end
     UIManager:show(InfoMessage:new{ text = output })
@@ -544,10 +410,6 @@ function VoiceBridge:addToMainMenu(menu_items)
             {
                 text = _("Run diagnostics"),
                 callback = function() self:runDiagnostics() end,
-            },
-            {
-                text = _("Test upload"),
-                callback = function() self:runUploadTest() end,
             },
             {
                 text = _("Inspect Bluetooth"),

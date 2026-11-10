@@ -201,8 +201,6 @@ class Experiment:
     def run(self):
         if self.pending is not None:
             raise Interrupted(f"Signal {self.pending} stopped the experiment.")
-        if not hasattr(signal, "pthread_sigmask"):
-            raise RuntimeError("Signal masking is unavailable.")
         if any(not hasattr(termios, name) for name in ("B2000000", "CRTSCTS", "IGNBRK")):
             raise RuntimeError("The required UART settings are unavailable.")
         self.commands = [shutil.which(name) for name in ("initctl", "lipc-set-prop")]
@@ -394,10 +392,7 @@ def main(argv=None):
         failed = True
         print(f"Experiment failed: {error}", file=sys.stderr, flush=True)
     finally:
-        if hasattr(signal, "pthread_sigmask"):
-            experiment.cleanup()
-        else:
-            print("Signal masking is unavailable. No handoff was started.", file=sys.stderr)
+        experiment.cleanup()
         signal.alarm(0)
         for sig, handler in old_handlers.items():
             signal.signal(sig, handler)

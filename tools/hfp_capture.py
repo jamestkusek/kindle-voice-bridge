@@ -1,38 +1,25 @@
 #!/usr/bin/env python3
 """Capture five seconds of HFP data through an authorized raw H:4 TCP relay.
 
-The laptop listens on one specific IPv4 address. The Kindle connects out to that
-listener and relays one controller. The laptop is an HFP Audio Gateway. The
-headset must offer an HFP Hands-Free SDP record and initiate the service-level
-connection. Bumble's SCO support is experimental. No hardware behavior has been
-verified.
+The laptop listens on one specific IPv4 address. The Kindle connects out to it
+and relays one controller. The laptop is an HFP Audio Gateway. The headset must
+offer an HFP Hands-Free SDP record and initiate the service-level connection.
 
 The controller is asked for 8 kHz, 16-bit linear PCM on the HCI path. It may
 return encoded data instead. The output is raw HCI payload bytes, not a WAV.
-Packet offsets and HCI status values are saved in a JSON sidecar. The status
-values do not measure packets that the controller never reports. On failure,
-the sidecar records the phase, a classified reason, and the exception type.
-It never records keys, HCI payloads, or addresses.
+Packet offsets and HCI status values go to a JSON sidecar, which never records
+keys, HCI payloads, or addresses. The status values do not measure packets that
+the controller never reports.
 
 The listener does not authenticate the Kindle client. Bumble drops outgoing
 packets while no client is attached, so the program creates the Device only
 after a client connects. The Kindle permits about 210 seconds of experiment
-after it connects. This program bounds the whole experiment below that limit.
+after it connects; this program bounds the whole experiment below that limit.
 
-Pairing, key transfer, retries, incoming connections, and controller recovery
-are outside this prototype. An optional existing Bumble JSON key store is read
-only. The store must contain a link key for the headset. Any namespace in the
-file is searched, so the store does not need this controller's address. A
-headset that requires pairing, another HFP role, or another codec will fail.
-The program does not signal an active call unless --simulate-call is given.
-Some headsets open their microphone only during a call, so that flag reports
-an incoming call and then an active call before SCO setup. It is unverified.
-The program sends no downlink audio unless the silence option is selected.
-
-The optional silence stream assumes the requested PCM format. Its effect and
-controller flow control are unverified. Protect both output files with local
-filesystem permissions. The raw file may contain private microphone data.
-This program does not restore Kindle Bluetooth.
+Pairing, key transfer, retries, and controller recovery are outside this
+prototype. An optional Bumble JSON key store is read only. The program does not
+restore Kindle Bluetooth. Protect both output files with local filesystem
+permissions: the raw file may contain private microphone data.
 """
 
 import argparse
@@ -82,10 +69,6 @@ NOTICE = (
     "This program does not restore Kindle Bluetooth.\n"
     "The raw output may contain private microphone data. The format is unverified."
 )
-
-
-class ServerShapeError(Exception):
-    pass
 
 
 class ClientDisconnected(Exception):
@@ -215,20 +198,6 @@ def connection_error_kind(error: Exception) -> str:
     return "unexpected error"
 
 
-def transport_error_details(error: Exception, include_type: bool = False) -> str:
-    details = []
-    if include_type:
-        name = type(error).__name__
-        if not name.isascii() or not name.isidentifier() or len(name) > 80:
-            name = "unknown"
-        details.append(f"type={name}")
-    for field in ("errno", "winerror"):
-        value = getattr(error, field, None)
-        if type(value) is int:
-            details.append(f"{field}={value}")
-    return f" ({', '.join(details)})" if details else ""
-
-
 def classify_reason(error) -> str:
     """Return a safe reason token. Never returns keys, payloads, or addresses."""
     if isinstance(error, CaptureFailure):
@@ -263,32 +232,11 @@ def describe_failure(error, phase, reason=None) -> dict:
     }
 
 
-def server_parts(hci_transport):
-    try:
-        source, sink, server = hci_transport.source, hci_transport.sink, hci_transport.server
-        if not all((
-            callable(source.set_packet_sink), callable(sink.on_packet),
-            callable(server.close), callable(server.wait_closed),
-            callable(hci_transport.close), hasattr(sink, "transport"),
-        )):
-            raise ServerShapeError()
-    except AttributeError as error:
-        raise ServerShapeError() from error
-    return sink, server
-
-
 async def wait_for_client(sink):
     async with asyncio.timeout(CLIENT_WAIT_TIMEOUT):
         while True:
-            try:
-                client = sink.transport
-            except AttributeError as error:
-                raise ServerShapeError() from error
+            client = sink.transport
             if client is not None:
-                if not all(callable(getattr(client, name, None)) for name in (
-                    "write", "close", "is_closing",
-                )):
-                    raise ServerShapeError()
                 if client.is_closing():
                     raise ClientDisconnected()
                 return client
@@ -309,11 +257,7 @@ class ClientWatch:
 
     async def _poll(self) -> None:
         while not self.lost.is_set():
-            try:
-                current = self.sink.transport
-            except AttributeError:
-                self.lost.set()
-                return
+            current = self.sink.transport
             if current is not self.client or self.client.is_closing():
                 self.lost.set()
                 return
@@ -370,9 +314,6 @@ class ReadOnlyKeys(KeyStore):
                 return PairingKeys.from_dict(entry)
         for peer, entry in peers:
             if peer.split("/", 1)[0] == plain:
-                return PairingKeys.from_dict(entry)
-        for peer, entry in peers:
-            if peer.lower() == name.lower() or peer.split("/", 1)[0].lower() == plain.lower():
                 return PairingKeys.from_dict(entry)
         return None
 
@@ -539,7 +480,7 @@ async def run_capture(args, capture: Capture) -> tuple[str, bool]:
         async with asyncio.timeout(STARTUP_TIMEOUT):
             async with asyncio.timeout(TRANSPORT_TIMEOUT):
                 hci_transport = await transport.open_transport(f"tcp-server:{args.host}:{args.port}")
-            sink, server = server_parts(hci_transport)
+            sink, server = hci_transport.sink, hci_transport.server
             phase = "client_wait"
             print(READY_LINE, flush=True)
             hci_client = await wait_for_client(sink)
@@ -662,9 +603,6 @@ async def run_capture(args, capture: Capture) -> tuple[str, bool]:
             failure = describe_failure(None, phase, "no_sco_payload")
         else:
             result = "Capture completed. The audio format is not verified."
-    except ServerShapeError as error:
-        result = "Local setup failed: unsupported Bumble server transport."
-        failure = describe_failure(error, phase, "unsupported_server_transport")
     except ClientDisconnected as error:
         result = f"Kindle HCI client disconnected during {PHASE_LABELS[phase]}. Capture aborted."
         failure = describe_failure(error, phase, "client_disconnected")
@@ -679,19 +617,12 @@ async def run_capture(args, capture: Capture) -> tuple[str, bool]:
             result = "Listener startup timed out."
         else:
             result = f"Capture {PHASE_LABELS[phase]} timed out."
-    except argparse.ArgumentTypeError as error:
-        result = "Local setup failed: invalid listener address."
-        failure = describe_failure(error, phase, "invalid_listener_address")
     except Exception as error:
         # Bumble exceptions can include addresses, keys, or packet data, so only
         # the classified reason and the type name are kept.
         failure = describe_failure(error, phase)
         if phase == "listener":
-            kind = connection_error_kind(error)
-            details = transport_error_details(
-                error, include_type=kind in ("operating system error", "unexpected error")
-            )
-            result = f"Listener startup failed: {kind}{details}."
+            result = f"Listener startup failed: {connection_error_kind(error)}."
         elif isinstance(error, OSError):
             result = f"Capture {PHASE_LABELS[phase]} failed: {connection_error_kind(error)}."
         else:

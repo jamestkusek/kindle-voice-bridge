@@ -43,18 +43,18 @@ receiver to its LAN address. Set `KVB_SERVER_URL` to that address and set
 `KVB_ALLOW_INSECURE_LAN=1` on the client. Do not expose this receiver directly to
 the internet. Use verified HTTPS for a remote server.
 
-## Laptop HCI probe dependency
+## Laptop HCI dependency
 
-To install the optional probe dependency, run this command from the project
-directory on the laptop:
+The laptop tools need Bumble 0.0.236. Install the optional dependency from the
+project directory:
 
 ```powershell
 python -m pip install -e '.[hci]'
 ```
 
-Run `python tools/hci_probe.py --help` for the probe's safety requirements.
-Review recovery and explicitly authorize the handoff before an HCI test. Bumble
-`power_off()` does not restore the Kindle's stock Bluetooth.
+Bumble `power_off()` does not restore the Kindle's stock Bluetooth. Review
+[docs/recovery.md](docs/recovery.md) and explicitly authorize the handoff before
+an HCI test.
 
 ## Working end-to-end flow
 
@@ -62,23 +62,20 @@ The laptop is the HFP Audio Gateway. The Kindle relays raw HCI from its Bluetoot
 UART to the laptop over one outbound TCP connection. The Kindle blocks inbound
 TCP, so the laptop must listen and the Kindle must connect out.
 
-1. Install the probe dependency on the laptop:
-
-   ```powershell
-   python -m pip install -e '.[hci]'
-   ```
-
-2. Convert the exported Kindle pairing store into a Bumble key store. This
+1. Convert the exported Kindle pairing store into a Bumble key store. This
    headset authenticated only with the key bytes reversed:
 
    ```powershell
    python tools/kindle_keys_to_bumble.py bt_devices.xml `
-     --namespace <controller-address> --reverse-key-bytes -o .data/keys.json
+     --reverse-key-bytes -o .data/keys.json
    ```
 
-   Write the key store under `.data/`, which `.gitignore` excludes.
+   The converter reads the `<bt_devices>` export, writes each peer under both
+   its plain address and Bumble's `AA:BB:CC:DD:EE:FF/P` form, and prints
+   addresses only. The listener searches every namespace, so `--namespace` is
+   not needed. Write the key store under `.data/`, which `.gitignore` excludes.
 
-3. Start the laptop listener first. It waits up to 180 seconds for the Kindle:
+2. Start the laptop listener first. It waits up to 180 seconds for the Kindle:
 
    ```powershell
    python tools/hfp_capture.py `
@@ -92,22 +89,28 @@ TCP, so the laptop must listen and the Kindle must connect out.
    The four `--acknowledge-*` and `--authorize-*` flags are required. Wait for
    `The HCI listener is ready.` before you touch the Kindle.
 
-4. On the Kindle, open the Voice Bridge plugin and select **Start HCI probe**.
+3. On the Kindle, open the Voice Bridge plugin and select **Start HCI probe**.
    The Kindle connects out to the laptop, hands off the Bluetooth UART, and
    relays raw H:4. Bluetooth drops twice per run by design and is restored
    afterwards. Use **Stop HCI probe** if the run does not end on its own.
 
-5. The listener records five seconds to `capture.raw` and writes the packet
-   metadata to `capture.raw.json` next to it. Inspect and convert:
+   The plugin exposes five actions: Run diagnostics, Inspect Bluetooth, Start
+   HCI probe, Stop HCI probe, and Export Bluetooth link keys. Start and Export
+   ask for confirmation first; the other three only read device state.
+
+4. The listener records five seconds to `capture.raw` and writes the packet
+   metadata to `capture.raw.json` next to it. Convert it:
 
    ```powershell
-   python tools/analyse_raw.py capture.raw 8000
    python tools/raw_to_wav.py capture.raw 8000 capture.wav
+   python tools/clean_raw_wav.py capture.raw 8000 capture-clean.wav --start 2.4
    ```
 
-   The first ~2.4 s of a capture is a non-speech artifact; speech starts after
-   it. The format is PCM16 mono 8 kHz by strong inference, not by controller
-   confirmation.
+   `clean_raw_wav.py` removes the DC offset, normalises the peak, and with
+   `--start` drops a leading section. The first ~2.4 s of a capture is a
+   non-speech artifact; nothing detects that boundary automatically, so the
+   start time is an operator choice. The format is PCM16 mono 8 kHz by strong
+   inference, not by controller confirmation.
 
 ### Security notes
 
