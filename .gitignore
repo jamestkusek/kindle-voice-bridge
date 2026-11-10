@@ -71,6 +71,10 @@ pip-wheel-metadata/
 secrets.json
 secrets.yaml
 secrets.yml
+# Kindle Bluetooth link keys exported by the plugin, and the source XML they
+# come from. Either file lets another device impersonate the Kindle.
+bt-keys.txt
+bt_devices.xml
 credentials.json
 credentials.yaml
 credentials.yml
