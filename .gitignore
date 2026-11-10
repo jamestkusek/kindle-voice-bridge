@@ -1,0 +1,98 @@
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+junit*.xml
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+wheels/
+pip-wheel-metadata/
+
+# Local runtime data: recordings, uploads and receiver storage
+/.data/
+/recordings/
+/uploads/
+/server/storage/
+*.wav
+*.wave
+*.mp3
+*.m4a
+*.aac
+*.ogg
+*.oga
+*.opus
+*.flac
+*.pcm
+*.s16le
+*.raw
+
+# Checked-in test fixtures are allowed to contain audio samples
+!tests/fixtures/**/*.wav
+!tests/fixtures/**/*.pcm
+!tests/fixtures/**/*.raw
+
+# Secrets and credentials
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+secrets.json
+secrets.yaml
+secrets.yml
+credentials.json
+credentials.yaml
+credentials.yml
+token.json
+
+# Local configuration; example files stay tracked
+config/*.json
+config/*.yaml
+config/*.yml
+config/*.toml
+!config/*.example.json
+!config/*.example.yaml
+!config/*.example.yml
+!config/*.example.toml
+
+# Logs
+*.log
+logs/
+
+# OS and editor noise
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
