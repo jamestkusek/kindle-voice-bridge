@@ -40,6 +40,13 @@ sent a generated WAV to the Windows receiver over Wi-Fi. The plugin no longer
 exposes that test as a menu action; the upload path is verified end to end but
 is not part of the HCI flow.
 
+The **Record and send** action and `kindle/voice_bridge/capture_local.py` are
+new and have not run on the device. They reuse the tested handoff and restore,
+Bumble on the Kindle controller, the settle detector and the upload path. They
+add three unproven things: Bumble's `serial:` transport on `/dev/ttymxc2`,
+Bumble and the Audio Gateway running on ARMv7, and the upload immediately after
+the Bluetooth restore.
+
 ## Network direction
 
 The Kindle blocks inbound TCP connections. The working direction is Kindle to
@@ -102,9 +109,14 @@ possibly invalid, missing data, or partially lost.
 ## Remaining known issues
 
 - The first ~2.4 s of a capture is a non-speech artifact, likely a stale or
-  unfed SCO receive buffer. Speech starts only after it. Trimming is manual:
-  `tools/clean_raw_wav.py --start 2.4` drops the artifact, but nothing detects
-  the boundary on its own.
+  unfed SCO receive buffer. Speech starts only after it. `tools/hfp_capture.py`
+  now discards it: a 0.40 s sliding window must show a small packet DC offset,
+  a zero-crossing rate of at least 600/s, and an RMS of at least 60 counts
+  before the capture starts recording. Replaying the three captures offline
+  (`tools/replay_settle.py`) settles run 3 at 2.587 s after discarding 690
+  packets and keeps the 2.393 s of speech; runs 1 and 2 never settle and would
+  now fail instead of writing junk. The thresholds are derived from these three
+  captures only, and the detector assumes PCM16 mono at 8 kHz.
 - The laptop's own cleanup sometimes reports a timeout while the Kindle
   restoration still succeeds. The timeout is a report on the laptop side, not
   proof that restoration failed.

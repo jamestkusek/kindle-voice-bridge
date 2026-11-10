@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Manually relay one raw H:4 connection after a PW4 Bluetooth handoff."""
+"""Manually relay one raw H:4 connection after a PW4 Bluetooth handoff.
+
+The handoff and the restore are separate methods, so another manual script can
+reuse them without a laptop relay. prepare(), handoff() and open_uart() take the
+UART from bsa_server. cleanup() restores Bluetooth and must always run.
+"""
 
 import argparse
 import os
@@ -174,10 +179,11 @@ def configure_uart(fd):
 
 
 class Experiment:
-    def __init__(self, args):
+    def __init__(self, args=None):
         self.args = args
         self.client = None
         self.uart = None
+        self.uart_closed = False
         self.latency_fd = None
         self.saved = None
         self.btd = None
@@ -194,11 +200,20 @@ class Experiment:
         self.pending = signum
         # Raise only inside the experiment. Cleanup must resume btd first.
         while frame is not None:
-            if frame.f_code is Experiment.run.__code__:
+            if frame.f_code in (Experiment.prepare.__code__,
+                                Experiment.handoff.__code__,
+                                Experiment.open_uart.__code__,
+                                Experiment.run.__code__):
                 raise Interrupted(f"Signal {signum} stopped the experiment.")
             frame = frame.f_back
 
-    def run(self):
+    def check_client(self):
+        # The relay path has a client. A local caller has none.
+        if self.client is not None:
+            check_peer(self.client)
+
+    def prepare(self):
+        """Check the environment and record the Bluetooth process baseline."""
         if self.pending is not None:
             raise Interrupted(f"Signal {self.pending} stopped the experiment.")
         if any(not hasattr(termios, name) for name in ("B2000000", "CRTSCTS", "IGNBRK")):
@@ -210,21 +225,15 @@ class Experiment:
             if not os.path.isfile(path) or not os.access(path, os.W_OK):
                 raise RuntimeError(f"The control {path} is not writable.")
         read_power()
-        initial = snapshot()
-        self.btd, self.bsa, btfd = initial
+        self.btd, self.bsa, self.btfd = snapshot()
 
-        # The connection attempt has its own limit. No handoff occurs before it.
-        signal.alarm(180)
-        print("Connecting to the laptop.", flush=True)
-        self.client = hci_relay.connect_to_laptop(
-            self.args.bind, self.args.peer, self.args.port, 20)
-        print("Connected to the laptop.", flush=True)
-        self.deadline = time.monotonic() + 210
-        # Reserve twenty seconds for cleanup.
-        signal.alarm(190)
+    def handoff(self, budget=210.0):
+        """Stop btd and take the UART from bsa_server. Call cleanup() after."""
+        self.deadline = time.monotonic() + budget
         read_power()
         current = snapshot()
-        if tuple(map(identity, current)) != tuple(map(identity, initial)):
+        if tuple(map(identity, current)) != tuple(
+                map(identity, (self.btd, self.bsa, self.btfd))):
             raise RuntimeError("Bluetooth process identities changed before handoff.")
         blocked = {signal.SIGALRM, signal.SIGTERM, signal.SIGINT}
         old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
@@ -237,7 +246,7 @@ class Experiment:
             raise OSError("The CPU latency request was not fully written.")
         old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
         try:
-            check_peer(self.client)
+            self.check_client()
             target_signal(self.btd, signal.SIGSTOP)
             self.stopped = True
         finally:
@@ -248,17 +257,18 @@ class Experiment:
         if (holders != {self.bsa[0]} or len(names["bsa_server"]) != 1 or
                 identity(names["bsa_server"][0]) != identity(self.bsa) or
                 len(names["btd"]) != 1 or identity(names["btd"][0]) != identity(self.btd) or
-                len(names["btfd"]) != 1 or identity(names["btfd"][0]) != identity(btfd) or
+                len(names["btfd"]) != 1 or
+                identity(names["btfd"][0]) != identity(self.btfd) or
                 names["btfd"][0][2] in "TtXZ" or same_process(self.btd, True) not in "Tt"):
             raise RuntimeError("The Bluetooth processes changed before handoff.")
         old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
         try:
-            check_peer(self.client)
+            self.check_client()
             target_signal(self.bsa, signal.SIGKILL)
             self.killed = True
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
-        check_peer(self.client)
+        self.check_client()
         wait_for(lambda: not processes()[1], time.monotonic() + 2,
                  "The UART was not released.")
         write_zero(PROTO)
@@ -266,11 +276,35 @@ class Experiment:
         time.sleep(0.5)
         if processes()[1]:
             raise RuntimeError("A process reclaimed the UART.")
+
+    def open_uart(self, defer=False):
+        """Open the UART and apply the raw H:4 settings.
+
+        With defer, close the descriptor again and keep the recorded settings,
+        so the caller owns the port and cleanup() can restore the settings.
+        """
         self.uart = os.open(UART, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
         if processes()[1] != {os.getpid()}:
             raise RuntimeError("The UART is not held exclusively by this process.")
         self.saved = termios.tcgetattr(self.uart)
         configure_uart(self.uart)
+        if defer:
+            os.close(self.uart)
+            self.uart = None
+            self.uart_closed = True
+
+    def run(self):
+        self.prepare()
+        # The connection attempt has its own limit. No handoff occurs before it.
+        signal.alarm(180)
+        print("Connecting to the laptop.", flush=True)
+        self.client = hci_relay.connect_to_laptop(
+            self.args.bind, self.args.peer, self.args.port, 20)
+        print("Connected to the laptop.", flush=True)
+        # Reserve twenty seconds for cleanup.
+        signal.alarm(190)
+        self.handoff()
+        self.open_uart()
         hci_relay.relay(self.client, self.uart)
         print("The client disconnected.", flush=True)
 
@@ -281,6 +315,14 @@ class Experiment:
             if frame.f_code is Experiment.attempt.__code__:
                 raise Interrupted("The cleanup time limit expired.")
             frame = frame.f_back
+
+    def restore_uart_settings(self):
+        """Reopen the UART and restore the settings recorded before handoff."""
+        fd = os.open(UART, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        try:
+            termios.tcsetattr(fd, termios.TCSANOW, self.saved)
+        finally:
+            os.close(fd)
 
     def attempt(self, label, action):
         try:
@@ -302,6 +344,9 @@ class Experiment:
                 self.uart, termios.TCSANOW, self.saved))
         if self.uart is not None:
             self.attempt("close UART", lambda: os.close(self.uart))
+        if self.uart_closed and self.saved is not None:
+            self.attempt("restore UART settings after handover",
+                         self.restore_uart_settings)
         if self.latency_fd is not None:
             self.attempt("close CPU latency request", lambda: os.close(self.latency_fd))
         if self.client is not None:

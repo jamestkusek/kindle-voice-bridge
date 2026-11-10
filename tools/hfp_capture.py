@@ -11,6 +11,14 @@ Packet offsets and HCI status values go to a JSON sidecar, which never records
 keys, HCI payloads, or addresses. The status values do not measure packets that
 the controller never reports.
 
+Every capture starts with about 2.4 seconds of stale or unfed SCO buffer
+content: a large DC offset, a frozen tonal envelope, and a constant 31,898
+plateau. The program discards packets until a sliding window of audio looks
+live, then records the requested duration of usable audio. If the stream never
+looks live within MAX_SETTLE_SECONDS it fails and writes no audio. --no-settle
+restores the old fixed-duration behaviour. The detector assumes 16-bit mono at
+8 kHz; if the controller returns encoded bytes its verdict is meaningless.
+
 The listener does not authenticate the Kindle client. Bumble drops outgoing
 packets while no client is attached, so the program creates the Device only
 after a client connects. The Kindle permits about 210 seconds of experiment
@@ -28,11 +36,14 @@ import errno
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import socket
+import struct
 import sys
 import time
+from collections import deque
 from pathlib import Path
 
 from bumble import core, hci, hfp, rfcomm, transport
@@ -41,6 +52,30 @@ from bumble.keys import JsonKeyStore, KeyStore, PairingKeys
 
 
 DURATION = 5.0
+# The requested HCI format is 16-bit mono PCM at 8 kHz. The settle detector
+# converts packet lengths to seconds with this rate; it is unverified.
+SAMPLE_RATE = 8000.0
+
+# Settle detector. Until the headset's audio path streams, the SCO receive path
+# returns stale or unfed buffer content. The three real captures in .data/ show
+# three signatures, measured per 0.40 s window of 60-byte packets:
+#   DC artifact   max |packet mean| 14,959..21,346; ZCR 0..148/s; RMS 70..1,037
+#   31,898 plateau max |packet mean| 31,898..32,721; ZCR 0/s; RMS 0..1,037
+#   live speech   max |packet mean| 113..641;      ZCR 1,057..2,921/s; RMS 161..943
+# capture1's low-level noise burst (never settles) peaks at max |packet mean| 63,
+# ZCR 1,670/s, RMS 22; capture2 is DC only. The thresholds sit between the two
+# groups: 3.1x above the worst speech DC and 7.5x below the artifact, 1.8x below
+# the quietest speech ZCR and 4x above the artifact, 2.7x below the quietest
+# speech RMS and 2.8x above capture1's noise.
+SETTLE_WINDOW_SECONDS = 0.40
+SETTLE_MEAN_LIMIT = 2000.0
+SETTLE_ZCR_MIN = 600.0
+SETTLE_RMS_MIN = 60.0
+# A stream that never looks live is a failure, not a recording. Bound the wait
+# so the whole session stays inside EXPERIMENT_BUDGET.
+MAX_SETTLE_SECONDS = 10.0
+MAX_CAPTURE_SECONDS = DURATION + MAX_SETTLE_SECONDS
+
 TRANSPORT_TIMEOUT = 20.0
 # The Kindle supervisor allows 180 seconds to connect, so the laptop is the
 # patient side. This wait starts before any experiment time is used.
@@ -160,6 +195,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True, type=Path, metavar="FILE", help="New raw output file. A .json sidecar is also created.")
     parser.add_argument("--keystore", type=Path, metavar="FILE", help="Existing local Bumble JSON key store. The program only reads it and searches all namespaces.")
     parser.add_argument("--send-pcm-silence", action="store_true", help="Send paced PCM silence. This option is unverified.")
+    parser.add_argument("--no-settle", action="store_true", help="Disable the settle detector and record the leading artifact as before.")
     parser.add_argument("--simulate-call", action="store_true", help="Report an incoming call, then an active call, before SCO setup. Unverified.")
     parser.add_argument("--acknowledge-controller-reset", action="store_true", required=True, help="Accept the controller reset and configuration changes.")
     parser.add_argument("--acknowledge-unencrypted-hci", action="store_true", required=True, help="Accept the plaintext HCI relay risk.")
@@ -374,8 +410,81 @@ class CaptureAg(hfp.AgProtocol):
         self.cmer_received.set()
 
 
+class SettleDetector:
+    """Decide when the SCO receive path starts delivering live audio.
+
+    A sliding window over the packet callback rejects the three signatures of
+    the startup artifact and accepts the first window that looks like live
+    audio. The window is trimmed to at least SETTLE_WINDOW_SECONDS of samples,
+    so the decision lags the window start by one window. settle_seconds names
+    the window start, which is the first sample worth keeping.
+    """
+
+    def __init__(self, window_seconds: float = SETTLE_WINDOW_SECONDS,
+                 mean_limit: float = SETTLE_MEAN_LIMIT,
+                 zcr_min: float = SETTLE_ZCR_MIN,
+                 rms_min: float = SETTLE_RMS_MIN,
+                 sample_rate: float = SAMPLE_RATE):
+        self.sample_rate = sample_rate
+        self.mean_limit = mean_limit
+        self.zcr_min = zcr_min
+        self.rms_min = rms_min
+        self.window_samples = max(1, int(round(window_seconds * sample_rate)))
+        self.samples_seen = 0
+        self.settled = False
+        self.settle_seconds = None
+        self.criterion = None
+        self._window = deque()
+        self._window_samples = 0
+        self._previous_sample = None
+
+    def feed(self, payload: bytes) -> bool:
+        """Add one SCO payload. Return True on the packet that settles."""
+        if self.settled:
+            return False
+        count = len(payload) // 2
+        if count == 0:
+            return False
+        samples = struct.unpack(f"<{count}h", payload[:count * 2])
+        mean = sum(samples) / count
+        energy = sum((value - mean) ** 2 for value in samples)
+        crossings = 0
+        previous = self._previous_sample if self._previous_sample is not None else samples[0]
+        for value in samples:
+            if (previous < 0 <= value) or (previous >= 0 > value):
+                crossings += 1
+            previous = value
+        self._previous_sample = samples[-1]
+        self.samples_seen += count
+
+        self._window.append((count, mean, energy, crossings))
+        self._window_samples += count
+        while self._window and self._window_samples - self._window[0][0] >= self.window_samples:
+            self._window_samples -= self._window.popleft()[0]
+        if self._window_samples < self.window_samples:
+            return False
+
+        window = self._window_samples
+        # A single plateau packet inside the window must fail the DC test, so
+        # take the largest packet mean rather than the mean of the means.
+        dc = max(abs(entry[1]) for entry in self._window)
+        rms = math.sqrt(sum(entry[2] for entry in self._window) / window)
+        zcr = sum(entry[3] for entry in self._window) * self.sample_rate / window
+        if dc <= self.mean_limit and zcr >= self.zcr_min and rms >= self.rms_min:
+            self.settled = True
+            self.settle_seconds = (self.samples_seen - window) / self.sample_rate
+            self.criterion = {
+                "max_abs_packet_dc": round(dc, 1),
+                "zero_crossing_rate_per_second": round(zcr, 1),
+                "rms": round(rms, 1),
+                "window_seconds": round(window / self.sample_rate, 3),
+            }
+            return True
+        return False
+
+
 class Capture:
-    def __init__(self):
+    def __init__(self, settle: bool = True):
         self.data = bytearray()
         self.packets = []
         self.status_counts = [0, 0, 0, 0]
@@ -386,12 +495,22 @@ class Capture:
         self.disconnect = False
         self.started = None
         self.elapsed = None
+        self.packets_received = 0
+        self.settle_enabled = settle
+        self.detector = SettleDetector() if settle else None
+        self.settled = not settle
+        self.settle_seconds = None
+        self.settle_criterion = None
+        self.discarded_packets = 0
+        self.usable_samples = 0
+        # Hold only the tail that a settle decision can still reach back to.
+        self.pending = deque()
+        self.pending_samples = 0
+        self.pending_start = 0
+        self.pending_limit = int((SETTLE_WINDOW_SECONDS + 0.5) * SAMPLE_RATE)
 
     def on_packet(self, packet) -> None:
         if self.stop.is_set():
-            return
-        if self.started is not None and time.monotonic() - self.started >= DURATION:
-            self.stop.set()
             return
         status = int(packet.packet_status)
         if not 0 <= status <= 3:
@@ -399,7 +518,45 @@ class Capture:
             self.stop.set()
             return
         self.status_counts[status] += 1
+        self.packets_received += 1
         payload = packet.data
+        if not self.settled:
+            self._hold(payload, status)
+            if self.detector.feed(payload):
+                self._release()
+            elif self.detector.samples_seen >= MAX_SETTLE_SECONDS * SAMPLE_RATE:
+                self.stop.set()
+            return
+        self._store(payload, status)
+        if self.usable_samples >= DURATION * SAMPLE_RATE:
+            self.stop.set()
+
+    def _hold(self, payload: bytes, status: int) -> None:
+        self.pending.append((self.pending_start, payload, status))
+        self.pending_start += len(payload) // 2
+        self.pending_samples += len(payload) // 2
+        while self.pending and self.pending_samples - len(self.pending[0][1]) // 2 >= self.pending_limit:
+            old = self.pending.popleft()
+            self.pending_samples -= len(old[1]) // 2
+            self.discarded_packets += 1
+
+    def _release(self) -> None:
+        self.settled = True
+        # Keep the exact sample boundary; the sidecar value is rounded only
+        # for display.
+        keep_from = int(round(self.detector.settle_seconds * SAMPLE_RATE))
+        self.settle_seconds = round(self.detector.settle_seconds, 3)
+        self.settle_criterion = self.detector.criterion
+        held = list(self.pending)
+        self.pending.clear()
+        self.pending_samples = 0
+        for start, payload, status in held:
+            if start >= keep_from:
+                self._store(payload, status)
+            else:
+                self.discarded_packets += 1
+
+    def _store(self, payload: bytes, status: int) -> None:
         if len(self.packets) >= MAX_PACKETS or len(self.data) + len(payload) > MAX_BYTES:
             self.dropped_bytes += len(payload)
             self.limit_hit = True
@@ -407,6 +564,7 @@ class Capture:
             return
         self.packets.append({"offset": len(self.data), "length": len(payload), "status": status})
         self.data.extend(payload)
+        self.usable_samples += len(payload) // 2
 
     def on_disconnect(self, *_args) -> None:
         self.disconnect = True
@@ -476,6 +634,8 @@ async def run_capture(args, capture: Capture) -> tuple[str, bool]:
     failure = None
     result = "Capture failed."
     cleanup_ok = True
+    # The settle detector needs the settle bound on top of the usable window.
+    session_cap = MAX_CAPTURE_SECONDS if capture.settle_enabled else DURATION
     try:
         async with asyncio.timeout(STARTUP_TIMEOUT):
             async with asyncio.timeout(TRANSPORT_TIMEOUT):
@@ -537,8 +697,8 @@ async def run_capture(args, capture: Capture) -> tuple[str, bool]:
             await simulate_call(ag, watch, deadline)
 
         phase = "sco_setup"
-        # Reserve the full recording window inside the experiment budget.
-        if remaining(deadline, DURATION) < DURATION:
+        # Reserve the whole recording window, including the settle bound.
+        if remaining(deadline, session_cap) < session_cap:
             raise BudgetExpired()
 
         loop = asyncio.get_running_loop()
@@ -551,7 +711,8 @@ async def run_capture(args, capture: Capture) -> tuple[str, bool]:
             connected_links.append(new_link)
             if capture.started is None and not capture.stop.is_set():
                 capture.started = time.monotonic()
-                capture_timer = loop.call_later(DURATION, capture.stop.set)
+                # A backstop only. The capture normally stops on usable samples.
+                capture_timer = loop.call_later(session_cap, capture.stop.set)
                 new_link.sink = capture.on_packet
                 new_link.on("disconnection", capture.on_disconnect)
             if not sco_result.done():
@@ -580,7 +741,7 @@ async def run_capture(args, capture: Capture) -> tuple[str, bool]:
         phase = "capture"
         if args.send_pcm_silence:
             silence = asyncio.create_task(send_silence(device, link, capture))
-        await watch.guard(capture.stop.wait(), DURATION + 1.0)
+        await watch.guard(capture.stop.wait(), session_cap + 1.0)
         if silence is not None:
             if not silence.done():
                 silence.cancel()
@@ -598,6 +759,12 @@ async def run_capture(args, capture: Capture) -> tuple[str, bool]:
         elif capture.invalid_status:
             result = "Capture stopped after an invalid SCO status."
             failure = describe_failure(None, phase, "invalid_sco_status")
+        elif capture.settle_enabled and not capture.settled:
+            result = (
+                "Capture discarded: the SCO stream never settled within "
+                f"{MAX_SETTLE_SECONDS:.0f} seconds. No audio was written."
+            )
+            failure = describe_failure(None, phase, "stream_never_settled")
         elif not capture.data:
             result = "Capture received no SCO payload bytes."
             failure = describe_failure(None, phase, "no_sco_payload")
@@ -629,7 +796,7 @@ async def run_capture(args, capture: Capture) -> tuple[str, bool]:
             result = f"Capture {PHASE_LABELS[phase]} failed."
     finally:
         if capture.started is not None:
-            capture.elapsed = round(min(time.monotonic() - capture.started, DURATION), 3)
+            capture.elapsed = round(min(time.monotonic() - capture.started, session_cap), 3)
         capture.stop.set()
         if capture_timer is not None:
             capture_timer.cancel()
@@ -686,6 +853,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.keystore is not None and not args.keystore.is_file():
         print("The key store must be an existing file.", file=sys.stderr)
         return 2
+    args.settle = not args.no_settle
     sidecar = Path(str(args.output) + ".json")
     try:
         raw = args.output.open("xb")
@@ -711,7 +879,7 @@ def main(argv: list[str] | None = None) -> int:
                     nonlocal capture
                     # Suppress background exception details from Bumble.
                     asyncio.get_running_loop().set_exception_handler(lambda _loop, _context: None)
-                    capture = Capture()
+                    capture = Capture(settle=args.settle)
                     return await run_capture(args, capture)
                 try:
                     result, cleanup_ok, failure = asyncio.run(run())
@@ -737,13 +905,35 @@ def main(argv: list[str] | None = None) -> int:
                     "client_wait_timeout_seconds": CLIENT_WAIT_TIMEOUT,
                     "experiment_budget_seconds": EXPERIMENT_BUDGET,
                     "requested_duration_seconds": DURATION,
+                    "requested_usable_audio_seconds": DURATION,
                     "capture_wait_seconds": getattr(capture, "elapsed", None),
+                    "settle_detection": "enabled" if args.settle else "disabled",
+                    "settle_window_seconds": SETTLE_WINDOW_SECONDS,
+                    "settle_thresholds": {
+                        "max_abs_packet_dc": SETTLE_MEAN_LIMIT,
+                        "min_zero_crossing_rate_per_second": SETTLE_ZCR_MIN,
+                        "min_rms": SETTLE_RMS_MIN,
+                    },
+                    "max_settle_seconds": MAX_SETTLE_SECONDS,
+                    "max_capture_seconds": MAX_CAPTURE_SECONDS,
+                    "settle_detected_seconds": getattr(capture, "settle_seconds", None),
+                    "packets_discarded_before_settle": (
+                        capture.discarded_packets if capture else 0
+                    ),
+                    "packets_received": capture.packets_received if capture else 0,
+                    "settle_criterion": getattr(capture, "settle_criterion", None),
+                    "usable_audio_seconds": (
+                        round(capture.usable_samples / SAMPLE_RATE, 3) if capture else 0.0
+                    ),
                     "requested_hci_format": "linear PCM, 8000 Hz, 16-bit, two's complement; unverified",
                     "air_codec_requested": "CVSD, eSCO S1",
                     "actual_format": "unknown",
                     "pcm_silence_requested": args.send_pcm_silence,
                     "call_simulation": (
                         "incoming_call_then_active" if args.simulate_call else "none"
+                    ),
+                    "packet_status_counts_scope": (
+                        "all received SCO packets, including discarded ones"
                     ),
                     "packet_status_counts": dict(zip(
                         ("correct", "possibly_invalid", "no_data", "partially_lost"),

@@ -7,8 +7,14 @@ local _ = require("gettext")
 local base_path = "/mnt/us/kindle-voice-bridge"
 local log_path = base_path .. "/diagnostics.txt"
 local bluetooth_log_path = base_path .. "/bluetooth-inspection.txt"
+local bumble_check_log_path = base_path .. "/bumble-check.txt"
+local record_log_path = base_path .. "/record-send.log"
 local end_marker = "\nDiagnostics complete.\n"
 local bluetooth_end_marker = "\nBluetooth inspection complete.\n"
+local bumble_check_end_marker = "\nBumble runtime check complete.\n"
+local record_end_marker = "\nRecord and send finished.\n"
+local record_wait_seconds = 200
+local record_poll_seconds = 3
 
 local hci_command = [[
 PYTHONHOME=/mnt/us/kindle-voice-bridge/python31117
@@ -291,6 +297,136 @@ fi
 printf '\nBluetooth inspection complete.\n'
 ]]
 
+-- Read-only. This command imports Python modules and writes one report file.
+-- It does not open the UART, start Bluetooth, or change any device state.
+local bumble_check_command = [[
+exec 2>&1
+printf 'Voice Bridge Bumble runtime check\n\n'
+runtime_home=/mnt/us/kindle-voice-bridge/python31117
+runtime="$runtime_home/bin/python3.11"
+bundle=/mnt/us/kindle-voice-bridge/bumble
+printf 'Python runtime: %s\n' "$runtime"
+if [ -f "$runtime" ]; then
+    printf 'Python runtime present: yes\n'
+else
+    printf 'Python runtime present: no\n'
+fi
+printf 'Bundle directory: %s\n' "$bundle"
+if [ -d "$bundle" ]; then
+    printf 'Bundle directory present: yes\n'
+else
+    printf 'Bundle directory present: no\n'
+fi
+printf '\n'
+if [ ! -f "$runtime" ]; then
+    printf 'The check did not run. The bundled Python is missing.\n'
+    printf '\nBumble runtime check complete.\n'
+    exit 1
+fi
+(
+    unset PYTHONSTARTUP PYTHONUSERBASE VIRTUAL_ENV
+    PYTHONHOME="$runtime_home"
+    PYTHONPATH="$bundle"
+    PYTHONNOUSERSITE=1
+    PYTHONDONTWRITEBYTECODE=1
+    LD_LIBRARY_PATH="$runtime_home/lib"
+    export PYTHONHOME PYTHONPATH PYTHONNOUSERSITE PYTHONDONTWRITEBYTECODE LD_LIBRARY_PATH
+    ulimit -c 0 2>/dev/null || :
+    "$runtime" -u -B -c '
+import os
+import sys
+print("Python version: " + sys.version.split()[0])
+print("Python executable: " + sys.executable)
+print("Python path: " + os.environ.get("PYTHONPATH", "unset"))
+print("")
+try:
+    import bumble
+    print("Bumble location: " + bumble.__file__)
+except Exception as error:
+    print("Bumble location: unavailable: " + type(error).__name__ + ": " + str(error))
+print("")
+modules = ["bumble.core", "bumble.hci", "bumble.keys", "bumble.device", "bumble.rfcomm", "bumble.hfp", "bumble.transport.common", "bumble.transport.serial"]
+print("Module imports:")
+failed = 0
+for name in modules:
+    try:
+        __import__(name)
+    except Exception as error:
+        failed = failed + 1
+        print("  " + name + ": FAIL: " + type(error).__name__ + ": " + str(error))
+    else:
+        print("  " + name + ": OK")
+print("")
+print("Module failures: " + str(failed))
+print("")
+try:
+    from bumble import crypto
+    print("Crypto backend: " + crypto.EccKey.__module__)
+    print("Crypto AES-CMAC backend: " + crypto.aes_cmac.__module__)
+    from bumble.crypto.builtin import aes_cmac
+    expected = "763cbcde81df9131bf897712c088edad"
+    actual = aes_cmac(bytes(16), bytes(16)).hex()
+    if actual == expected:
+        print("Crypto AES-CMAC self-test: pass")
+    else:
+        print("Crypto AES-CMAC self-test: fail: got " + actual)
+except Exception as error:
+    print("Crypto backend: unavailable: " + type(error).__name__ + ": " + str(error))
+print("")
+try:
+    from bumble._version import version
+    print("Bumble version: " + version)
+except Exception as error:
+    print("Bumble version: unavailable: " + type(error).__name__ + ": " + str(error))
+print("")
+bundle = os.environ.get("PYTHONPATH", "")
+count = 0
+if bundle and os.path.isdir(bundle):
+    for root, dirs, files in os.walk(bundle):
+        count = count + len(files)
+    print("Bundle file count: " + str(count))
+else:
+    print("Bundle file count: unavailable")
+'
+)
+printf '\nPython exit status: %s\n' "$?"
+printf '\nBumble runtime check complete.\n'
+]]
+
+-- Manual start only. This command stops the stock Bluetooth daemon and
+-- restores it in a finally path. The script deletes upload.json after it reads
+-- the token. The result line is written to the log.
+local record_command = [[
+exec 2>&1
+printf 'Voice Bridge record and send\n\n'
+runtime_home=/mnt/us/kindle-voice-bridge/python31117
+runtime="$runtime_home/bin/python3.11"
+bundle=/mnt/us/kindle-voice-bridge/bumble
+if [ ! -f "$runtime" ]; then
+    printf 'The bundled Python is missing.\n'
+    printf '\nResult: not sent. The bundled Python is missing.\n'
+    printf '\nRecord and send finished.\n'
+    exit 1
+fi
+(
+    unset PYTHONPATH PYTHONSTARTUP PYTHONUSERBASE VIRTUAL_ENV
+    PYTHONHOME="$runtime_home"
+    PYTHONPATH="$bundle"
+    PYTHONNOUSERSITE=1
+    PYTHONDONTWRITEBYTECODE=1
+    LD_LIBRARY_PATH="$runtime_home/lib"
+    export PYTHONHOME PYTHONPATH PYTHONNOUSERSITE PYTHONDONTWRITEBYTECODE LD_LIBRARY_PATH
+    ulimit -c 0 2>/dev/null || :
+    "$runtime" -u -B /mnt/us/kindle-voice-bridge/capture_local.py \
+        --config /mnt/us/kindle-voice-bridge/upload.json \
+        --authorize-bluetooth-handoff \
+        --authorize-microphone-recording \
+        --confirm-bluetooth-enabled-in-ui
+)
+printf '\nExit status: %s\n' "$?"
+printf '\nRecord and send finished.\n'
+]]
+
 local export_keys_command = [[
 exec 2>&1
 keys_source=/var/local/zbluetooth/bt_devices.xml
@@ -315,6 +451,26 @@ local function run(command)
     if read_ok then return text end
 end
 
+local function read(path)
+    local file = io.open(path, "r")
+    if not file then return nil end
+    local read_ok, text = pcall(file.read, file, "*a")
+    pcall(file.close, file)
+    if read_ok then return text end
+end
+
+-- The device script prints one line that starts with "Result: ".
+local function last_result(text)
+    if not text then return nil end
+    local result = nil
+    for line in text:gmatch("[^\n]+") do
+        if line:sub(1, 8) == "Result: " then
+            result = line:sub(9)
+        end
+    end
+    return result
+end
+
 local function save(path, text)
     local file = io.open(path, "w")
     if not file then return false end
@@ -326,6 +482,7 @@ end
 local VoiceBridge = WidgetContainer:extend{
     name = "voicebridge",
     is_doc_only = false,
+    record_running = false,
 }
 
 function VoiceBridge:init()
@@ -366,6 +523,23 @@ function VoiceBridge:inspectBluetooth()
     UIManager:show(InfoMessage:new{ text = message })
 end
 
+function VoiceBridge:checkBumbleRuntime()
+    local output = run(bumble_check_command) or ""
+    local complete = output:sub(-#bumble_check_end_marker) == bumble_check_end_marker
+    if not complete then
+        output = output .. "\nThe Bumble runtime check did not finish.\n"
+    end
+    local message
+    if not save(bumble_check_log_path, output) then
+        message = _("The plugin cannot save bumble-check.txt. Check that /mnt/us/kindle-voice-bridge exists and is writable. Check the free space.")
+    elseif not complete then
+        message = _("The Bumble runtime check did not finish. The plugin saved a partial report. Restart KOReader and try again.")
+    else
+        message = _("The plugin saved bumble-check.txt. Connect USB storage. Open kindle-voice-bridge/bumble-check.txt on your computer.")
+    end
+    UIManager:show(InfoMessage:new{ text = message })
+end
+
 function VoiceBridge:exportBluetoothKeys()
     local output = run(export_keys_command)
     if not output or output == "" then
@@ -379,6 +553,57 @@ function VoiceBridge:confirmExportBluetoothKeys()
         text = _("The exported file contains secret Bluetooth link keys. Another device can use these keys to impersonate the Bluetooth identity of this Kindle. The plugin writes the keys to /mnt/us/kindle-voice-bridge/bt-keys.txt. Delete this file after the test. Export the keys?"),
         ok_text = _("Export"),
         ok_callback = function() self:exportBluetoothKeys() end,
+    })
+end
+
+function VoiceBridge:startRecordAndSend()
+    if self.record_running then
+        UIManager:show(InfoMessage:new{ text = _("A recording is already running.") })
+        return
+    end
+    os.remove(record_log_path)
+    local pipe = io.popen("(" .. record_command .. ") > " .. record_log_path .. " 2>&1 &", "r")
+    if not pipe then
+        UIManager:show(InfoMessage:new{ text = _("The plugin could not start the recording.") })
+        return
+    end
+    pcall(pipe.close, pipe)
+    self.record_running = true
+    UIManager:show(InfoMessage:new{
+        text = _("The recording started. Bluetooth stops for about one minute. The result appears when the run ends."),
+    })
+    UIManager:scheduleIn(record_poll_seconds, function()
+        self:watchRecordLog(os.time() + record_wait_seconds)
+    end)
+end
+
+function VoiceBridge:watchRecordLog(deadline)
+    local text = read(record_log_path)
+    local complete = text ~= nil and text:sub(-#record_end_marker) == record_end_marker
+    if not complete and os.time() < deadline then
+        UIManager:scheduleIn(record_poll_seconds, function()
+            self:watchRecordLog(deadline)
+        end)
+        return
+    end
+    self.record_running = false
+    local result = last_result(text)
+    local message
+    if not complete then
+        message = _("The run did not finish. It may still be running. Open kindle-voice-bridge/record-send.log to check.")
+    elseif result then
+        message = _("Result: ") .. result
+    else
+        message = _("The run finished without a result. Open kindle-voice-bridge/record-send.log to check.")
+    end
+    UIManager:show(InfoMessage:new{ text = message })
+end
+
+function VoiceBridge:confirmRecordAndSend()
+    UIManager:show(ConfirmBox:new{
+        text = _("This action records the headset microphone for about five seconds and sends the recording to the receiver. Bluetooth stops twice during the run. A crash can leave Bluetooth unusable. The run reads /mnt/us/kindle-voice-bridge/upload.json and deletes it. Start the recording?"),
+        ok_text = _("Record"),
+        ok_callback = function() self:startRecordAndSend() end,
     })
 end
 
@@ -414,6 +639,14 @@ function VoiceBridge:addToMainMenu(menu_items)
             {
                 text = _("Inspect Bluetooth"),
                 callback = function() self:inspectBluetooth() end,
+            },
+            {
+                text = _("Check Bumble runtime"),
+                callback = function() self:checkBumbleRuntime() end,
+            },
+            {
+                text = _("Record and send"),
+                callback = function() self:confirmRecordAndSend() end,
             },
             {
                 text = _("Start HCI probe"),

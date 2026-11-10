@@ -94,23 +94,71 @@ TCP, so the laptop must listen and the Kindle must connect out.
    relays raw H:4. Bluetooth drops twice per run by design and is restored
    afterwards. Use **Stop HCI probe** if the run does not end on its own.
 
-   The plugin exposes five actions: Run diagnostics, Inspect Bluetooth, Start
-   HCI probe, Stop HCI probe, and Export Bluetooth link keys. Start and Export
-   ask for confirmation first; the other three only read device state.
+   The plugin exposes six actions: Run diagnostics, Inspect Bluetooth, Check
+   Bumble runtime, Record and send, Start HCI probe, and Export Bluetooth link
+   keys. Record and send, Start and Export ask for confirmation first; the other
+   three only read device state.
 
-4. The listener records five seconds to `capture.raw` and writes the packet
-   metadata to `capture.raw.json` next to it. Convert it:
+4. The listener records five seconds of usable audio to `capture.raw` and
+   writes the packet metadata to `capture.raw.json` next to it. Convert it:
 
    ```powershell
    python tools/raw_to_wav.py capture.raw 8000 capture.wav
-   python tools/clean_raw_wav.py capture.raw 8000 capture-clean.wav --start 2.4
+   python tools/clean_raw_wav.py capture.raw 8000 capture-clean.wav
    ```
 
-   `clean_raw_wav.py` removes the DC offset, normalises the peak, and with
-   `--start` drops a leading section. The first ~2.4 s of a capture is a
-   non-speech artifact; nothing detects that boundary automatically, so the
-   start time is an operator choice. The format is PCM16 mono 8 kHz by strong
-   inference, not by controller confirmation.
+   `clean_raw_wav.py` removes the DC offset and normalises the peak. The
+   capture itself now drops the leading non-speech artifact: `hfp_capture.py`
+   holds packets until a 0.40 s window looks like live audio, then records the
+   requested five seconds of usable audio. The JSON sidecar records the settle
+   time, the discarded packet count, and the criterion values. If the stream
+   never settles within 10 seconds the capture fails and writes no audio.
+   `--no-settle` restores the old fixed five-second behaviour; on those files
+   add `--start 2.4` to `clean_raw_wav.py` to trim the artifact by hand. The
+   format is PCM16 mono 8 kHz by strong inference, not by controller
+   confirmation, and the detector assumes that format.
+
+   To check the detector against an existing capture without touching it:
+
+   ```powershell
+   python tools/replay_settle.py .data/capture3.raw .data/capture.raw
+   ```
+
+### On-device capture
+
+`kindle/voice_bridge/capture_local.py` records and sends in one step, with no
+laptop. It reads the headset link key from the Kindle pairing store, performs
+the Bluetooth handoff, runs the HFP Audio Gateway with Bumble on the device,
+writes a mono 8 kHz 16-bit PCM WAV in `/tmp`, restores Bluetooth, uploads the
+WAV, and deletes it.
+
+This path is **not yet tested on hardware**. The parts it uses are tested
+separately: the handoff and restore, Bumble on the Kindle controller, and the
+upload.
+
+Deploy steps:
+
+1. Copy `capture_local.py`, `pw4_supervisor.py` and `uploader.py` to
+   `/mnt/us/kindle-voice-bridge/`.
+2. Write `/mnt/us/kindle-voice-bridge/upload.json` with
+   `{"server_url": "...", "token": "..."}`. The script deletes this file after
+   it reads the token, so a failed run needs a new copy.
+3. Start it from a device shell, or use **Record and send** in the plugin.
+
+```sh
+cd /mnt/us/kindle-voice-bridge
+PYTHONHOME=/mnt/us/kindle-voice-bridge/python31117 \
+PYTHONPATH=/mnt/us/kindle-voice-bridge/bumble \
+LD_LIBRARY_PATH=/mnt/us/kindle-voice-bridge/python31117/lib \
+/mnt/us/kindle-voice-bridge/python31117/bin/python3.11 -u -B \
+  capture_local.py --config upload.json \
+  --authorize-bluetooth-handoff --authorize-microphone-recording \
+  --confirm-bluetooth-enabled-in-ui
+```
+
+Add `--headset 95:05:BB:2A:34:2E` when the pairing store holds more than one
+device. The script prints one line that starts with `Result: `. The plugin
+reads that line and shows it.
 
 ### Security notes
 
@@ -123,6 +171,8 @@ TCP, so the laptop must listen and the Kindle must connect out.
   and the project's `python.exe`. Remove the rule when you finish.
 - Raw captures may contain private microphone audio. `.gitignore` excludes
   `*.wav` and `.data/`; keep captures out of version control.
+- `upload.json` holds the bearer token. The on-device script deletes it after
+  it reads the token. Copy a new one for each run.
 
 The upload contract is in [docs/protocol.md](docs/protocol.md). The project plan
 and hardware precautions are in [PLAN.md](PLAN.md).
