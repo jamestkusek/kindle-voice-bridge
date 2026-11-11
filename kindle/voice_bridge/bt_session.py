@@ -82,6 +82,7 @@ except ImportError:  # Windows test hosts have no fcntl.
 
 SOCKET_PATH = "/tmp/voicebridge-bt-session.sock"
 STATE_PATH = "/tmp/voicebridge-bt-session.state"
+COMMAND_PATH = "/tmp/voicebridge-bt-session.cmd"
 STATE_INTERVAL_SECONDS = 0.1
 CONTROL_TIMEOUT = 5.0
 CONTROL_LINE_LIMIT = 1024
@@ -234,7 +235,7 @@ class Session:
                  capture_local, uploader, pw4_supervisor,
                  keep_latency=False, control_factory=None,
                  manual_max_duration=MAX_MANUAL_RECORD_SECONDS,
-                 state_path=STATE_PATH):
+                 state_path=STATE_PATH, command_path=COMMAND_PATH):
         self.experiment = experiment
         self.controller_factory = controller_factory
         self.config = config
@@ -260,6 +261,7 @@ class Session:
         if self.manual_max_duration <= 0:
             raise ValueError("manual_max_duration must be greater than zero")
         self.state_path = state_path
+        self.command_path = command_path
         self.state_task = None
         self.heartbeat = 0
         self.recording_started_at = None
@@ -380,9 +382,44 @@ class Session:
         except OSError:
             pass
 
+    def poll_command_file(self):
+        """Apply one queued command from the plugin.
+
+        The plugin writes this file instead of starting a client process. A
+        client process takes several seconds to start on the device, which is
+        longer than the capture can wait.
+        """
+        if not self.command_path:
+            return
+        try:
+            with open(self.command_path, "r", encoding="ascii",
+                      errors="replace") as source:
+                command = source.read(64).strip()
+        except OSError:
+            return
+        try:
+            os.unlink(self.command_path)
+        except OSError:
+            pass
+        if not command:
+            return
+        if command == "stop_recording":
+            event = self.manual_stop_event
+            if event is not None and self.recording:
+                event.set()
+
+    def remove_command_file(self):
+        if not self.command_path:
+            return
+        try:
+            os.unlink(self.command_path)
+        except OSError:
+            pass
+
     async def state_loop(self):
         while True:
             self.write_state_file()
+            self.poll_command_file()
             await asyncio.sleep(STATE_INTERVAL_SECONDS)
 
     async def dispatch(self, line):
@@ -780,6 +817,7 @@ class Session:
                         await asyncio.gather(self.state_task, return_exceptions=True)
                         self.state_task = None
                     self.remove_state_file()
+                    self.remove_command_file()
             finally:
                 if self.control is not None:
                     await self.control.close()
@@ -1278,6 +1316,7 @@ async def run_session(session):
         finally:
             try:
                 session.remove_state_file()
+                session.remove_command_file()
             except Exception:
                 pass
             session.lock.release()

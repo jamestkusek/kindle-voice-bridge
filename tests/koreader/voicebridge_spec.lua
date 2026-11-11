@@ -311,6 +311,17 @@ check(page.covers_fullscreen ~= true, "the bar is not marked fullscreen")
 equal(page.ges_events.TapStop[1].range.h, page.dimen.h,
     "the tap range is the bar height")
 
+-- 14. The stop command is a file write, not a process spawn.
+local command_file = STATE .. ".cmd"
+page = new_page()
+page.command_path = command_file
+page.spawn_stop = nil
+check(page:spawn_stop(), "spawn_stop reports success")
+local handle = assert(io.open(command_file, "r"), "the command file was written")
+equal(handle:read("*l"), "stop_recording", "the stop command is written")
+handle:close()
+os.remove(command_file)
+
 os.remove(STATE)
 os.remove(STATE .. ".bad")
 

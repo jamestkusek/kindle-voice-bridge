@@ -19,6 +19,7 @@ local _ = require("gettext")
 
 local base_path = "/mnt/us/kindle-voice-bridge"
 local state_path = "/tmp/voicebridge-bt-session.state"
+local command_path = "/tmp/voicebridge-bt-session.cmd"
 local log_path = base_path .. "/diagnostics.txt"
 local bluetooth_log_path = base_path .. "/bluetooth-inspection.txt"
 local bumble_check_log_path = base_path .. "/bumble-check.txt"
@@ -850,6 +851,14 @@ local page_stale_ticks = 6   -- 1.5 s without a heartbeat change
 local page_start_ticks = 20  -- 5 s to leave idle after Start
 local page_stop_ticks = 80   -- 20 s for a stop to finish
 
+local function write_command(path, text)
+    local file = io.open(path, "w")
+    if not file then return false end
+    local written = file:write(text)
+    local closed = file:close()
+    return written and closed
+end
+
 local function read_state(path)
     local file = io.open(path or state_path, "r")
     if not file then return nil end
@@ -883,6 +892,7 @@ local RecordPage = InputContainer:extend{
     stop_requested = false,
     closed = false,
     state_path = nil,
+    command_path = nil,
 }
 
 function RecordPage:init()
@@ -1170,11 +1180,9 @@ function RecordPage:finish_result(reply)
 end
 
 function RecordPage:spawn_stop()
-    local pipe = io.popen("(" .. session_stop_recording_command .. ") > " ..
-        manual_record_log_path .. " 2>&1 &", "r")
-    if not pipe then return false end
-    pcall(pipe.close, pipe)
-    return true
+    -- The daemon polls this file every 100 ms. Starting a client process takes
+    -- several seconds on the device, which is longer than the capture can wait.
+    return write_command(self.command_path or command_path, "stop_recording\n")
 end
 
 function RecordPage:request_stop()
@@ -1277,15 +1285,12 @@ function VoiceBridge:stopManualRecording()
     -- A recording is running that this plugin did not start. Take it over.
     self.record_page = RecordPage:new{ phase = "stopping", stop_requested = true }
     self.record_page:start()
-    local pipe = io.popen("(" .. session_stop_recording_command .. ") > " ..
-        manual_record_log_path .. " 2>&1 &", "r")
-    if not pipe then
+    if not write_command(command_path, "stop_recording\n") then
         UIManager:show(InfoMessage:new{
             text = _("The plugin could not start Stop & send."),
         })
         return
     end
-    pcall(pipe.close, pipe)
 end
 
 function VoiceBridge:toggleManualRecording()

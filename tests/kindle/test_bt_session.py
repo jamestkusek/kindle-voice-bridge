@@ -237,6 +237,7 @@ def build_session(tmp_path, controller, experiment=None, idle_timeout=600,
         keep_latency=keep_latency,
         control_factory=control_factory if fake_control else None,
         state_path=str(tmp_path / "session.state"),
+        command_path=str(tmp_path / "session.cmd"),
     )
     return session, capture_local, uploader, experiment
 
@@ -601,3 +602,58 @@ def test_state_file_carries_the_last_result(tmp_path):
 
     fields = path.read_text(encoding="ascii").rstrip("\n").split(" ", 6)
     assert fields[2:] == ["idle", "-1", "-1", "starting", "ok sent rec_1 5.00s"]
+
+
+def test_command_file_stops_a_manual_recording(tmp_path):
+    controller = FakeController()
+    session, capture_local, uploader, experiment = build_session(tmp_path, controller)
+    command_path = tmp_path / "session.cmd"
+    event = asyncio.Event()
+    session.recording = True
+    session.record_kind = "manual"
+    session.manual_stop_event = event
+
+    command_path.write_text("stop_recording\n", encoding="ascii")
+    session.poll_command_file()
+
+    assert event.is_set()
+    assert not command_path.exists()
+
+
+def test_command_file_is_ignored_when_no_recording_runs(tmp_path):
+    controller = FakeController()
+    session, capture_local, uploader, experiment = build_session(tmp_path, controller)
+    command_path = tmp_path / "session.cmd"
+    event = asyncio.Event()
+    session.recording = False
+    session.manual_stop_event = event
+
+    command_path.write_text("stop_recording\n", encoding="ascii")
+    session.poll_command_file()
+
+    assert not event.is_set()
+    assert not command_path.exists()
+
+
+def test_an_unknown_command_is_discarded(tmp_path):
+    controller = FakeController()
+    session, capture_local, uploader, experiment = build_session(tmp_path, controller)
+    command_path = tmp_path / "session.cmd"
+    event = asyncio.Event()
+    session.recording = True
+    session.manual_stop_event = event
+
+    command_path.write_text("reboot\n", encoding="ascii")
+    session.poll_command_file()
+
+    assert not event.is_set()
+    assert not command_path.exists()
+
+
+def test_a_missing_command_file_is_harmless(tmp_path):
+    controller = FakeController()
+    session, capture_local, uploader, experiment = build_session(tmp_path, controller)
+
+    session.poll_command_file()
+
+    assert not (tmp_path / "session.cmd").exists()
