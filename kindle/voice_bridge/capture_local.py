@@ -93,6 +93,14 @@ SETTLE_ZCR_MIN = 600.0
 SETTLE_RMS_MIN = 60.0
 MAX_SETTLE_SECONDS = 10.0
 
+# The manual path cues the user when the microphone starts converting audio,
+# which is not the same moment as SCO open. A live microphone has an AC noise
+# floor; digital silence and the startup DC plateau have none. This threshold is
+# far below SETTLE_RMS_MIN because it decides "converting", not "speech".
+AUDIO_READY_RMS = 4.0
+# If no signal appears, start anyway so a quiet headset cannot stall the run.
+AUDIO_READY_TIMEOUT = 4.0
+
 MAX_PCM_BYTES = int(SAMPLE_RATE * SAMPLE_WIDTH * (DURATION + 2.0))
 
 # The alarm stops the run. The deadline leaves time for the Bluetooth restore
@@ -267,6 +275,22 @@ def load_keystore(path, wanted=None):
 # -----------------------------------------------------------------------------
 # HFP capture
 # -----------------------------------------------------------------------------
+def ac_rms(payload):
+    """Return the AC RMS of one PCM16 payload, in sample counts.
+
+    The DC component is removed first, so a constant plateau reads as zero. This
+    is what separates a live microphone from digital silence and from the
+    startup DC artifact.
+    """
+
+    count = len(payload) // 2
+    if count == 0:
+        return 0.0
+    samples = struct.unpack(f"<{count}h", payload[:count * 2])
+    mean = sum(samples) / count
+    return math.sqrt(sum((value - mean) ** 2 for value in samples) / count)
+
+
 class SettleDetector:
     """Decide when the SCO receive path starts delivering live audio.
 
@@ -380,6 +404,18 @@ class Capture:
         self.settle_after_sco_seconds = None
         self.silence_used = False
         self.silence_error = None
+        # Manual path: when the microphone actually started converting audio.
+        # Everything before cue_offset is trimmed from the WAV, so the user gets
+        # the full max_duration from the moment they are told to speak.
+        self.cue_offset = None
+        self.cue_at = None
+        self.audio_event = asyncio.Event()
+        self.first_packet_at = None
+        self.first_signal_at = None
+        self.first_speech_at = None
+        self.max_ac_rms = 0.0
+        # Measurement only. It never decides anything on the manual path.
+        self.probe = SettleDetector()
         # Hold only the tail that a settle decision can still reach back to.
         self.pending = deque()
         self.pending_samples = 0
@@ -396,8 +432,9 @@ class Capture:
             return
         payload = packet.data
         if self.detector is None:
+            self._note_arrival(payload)
             self._store(payload)
-            if self.samples >= self.max_samples:
+            if self._stored_after_cue() >= self.max_pcm_bytes:
                 self.max_duration_reached = True
                 self.stop.set()
             return
@@ -411,6 +448,57 @@ class Capture:
         self._store(payload)
         if self.samples >= DURATION * SAMPLE_RATE:
             self.stop.set()
+
+    def _note_arrival(self, payload):
+        """Timestamp the first packet, the first signal, and the first speech.
+
+        The manual path stores every packet, so these values only drive the cue
+        and the log. They never change what is kept.
+        """
+        now = time.monotonic()
+        if self.first_packet_at is None:
+            self.first_packet_at = now
+        level = ac_rms(payload)
+        if level > self.max_ac_rms:
+            self.max_ac_rms = level
+        if self.first_signal_at is None and level > AUDIO_READY_RMS:
+            self.first_signal_at = now
+            if self.cue_offset is None:
+                # Cue before this packet, so the packet that proved the
+                # microphone is live is the first sample kept.
+                self.cue_offset = len(self.data)
+                self.cue_at = now
+                self.audio_event.set()
+        if self.first_speech_at is None and self.probe.feed(payload):
+            self.first_speech_at = now
+
+    def _stored_after_cue(self):
+        """Return the bytes stored since the cue, or all bytes before it."""
+        return len(self.data) - (self.cue_offset or 0)
+
+    def force_cue(self):
+        """Cue without a signal, for a headset that never reports a noise floor."""
+        if self.cue_offset is not None:
+            return
+        self.cue_offset = len(self.data)
+        self.cue_at = time.monotonic()
+        self.audio_event.set()
+
+    def arrival_line(self):
+        """Describe when the audio path came up, relative to SCO open."""
+        opened = self.sco_opened_at
+        if opened is None:
+            return None
+
+        def at(value):
+            return "never" if value is None else f"{value - opened:.2f} s"
+
+        return (
+            f"Audio: first packet {at(self.first_packet_at)}, "
+            f"first signal {at(self.first_signal_at)} "
+            f"(threshold {AUDIO_READY_RMS:g}, peak {self.max_ac_rms:.1f}), "
+            f"first speech {at(self.first_speech_at)} after SCO open."
+        )
 
     def _hold(self, payload):
         self.pending.append((self.pending_start, payload))
@@ -446,7 +534,7 @@ class Capture:
         payload = payload[:len(payload) & ~1]
         if not payload:
             return
-        remaining = self.max_pcm_bytes - len(self.data)
+        remaining = self.max_pcm_bytes - self._stored_after_cue()
         if remaining <= 0:
             if self.detector is None:
                 self.max_duration_reached = True

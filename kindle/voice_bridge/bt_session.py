@@ -1094,6 +1094,17 @@ class BumbleController:
                 capture.silence_used = True
                 self._silence_task = asyncio.create_task(
                     self.capture_local.send_silence(self.device, link, capture))
+            # SCO open means the local link is ready, not that the headset is
+            # sending audio. Cue only once the microphone is converting, so the
+            # first thing the user says is not lost.
+            try:
+                await asyncio.wait_for(
+                    capture.audio_event.wait(),
+                    self.capture_local.AUDIO_READY_TIMEOUT)
+            except TimeoutError:
+                capture.force_cue()
+                print("Audio: no signal before the deadline; cueing anyway.",
+                      file=sys.stderr, flush=True)
             self._notify_phase("recording")
             return capture
         except asyncio.CancelledError:
@@ -1123,8 +1134,11 @@ class BumbleController:
             failure = "The headset disconnected during the recording."
         elif not capture.data:
             failure = "The headset did not stream audio."
+        line = capture.arrival_line()
+        if line:
+            print(line, flush=True)
         report = self.capture_local.CaptureReport(
-            pcm=bytes(capture.data),
+            pcm=bytes(capture.data[capture.cue_offset or 0:]),
             settle_seconds=None,
             settle_after_sco_seconds=None,
             silence_used=capture.silence_used,

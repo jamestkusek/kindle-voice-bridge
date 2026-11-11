@@ -146,6 +146,33 @@ NOW** appears within about a second of the microphone going live, that the
 countdown matches the real remaining time, and that the page does not ghost
 badly after 15 one-second partial refreshes.
 
+### Cue timing
+
+SCO open is local readiness, not microphone readiness. On the first hardware
+runs the operator reported the first one to two seconds of speech missing even
+though the page already said **SPEAK NOW**, so the cue was firing too early.
+
+The manual path now cues on the first packet whose AC RMS exceeds
+`AUDIO_READY_RMS` (4.0 counts). Digital silence and the startup DC plateau both
+read as zero AC energy, so they cannot trigger it. Everything before the cue is
+trimmed from the WAV, and the 15-second cap counts only audio after the cue, so
+the operator gets the full window from the moment they are told to speak. If no
+signal appears within `AUDIO_READY_TIMEOUT` (4 s) the capture cues anyway, so a
+quiet headset cannot stall the run.
+
+Each manual capture now logs one line:
+
+```text
+Audio: first packet 0.31 s, first signal 2.14 s (threshold 4, peak 37.2),
+first speech 2.61 s after SCO open.
+```
+
+That line is the measurement. If `first signal` is close to `first packet`, the
+microphone was live all along and the earlier loss was something else. If
+`first signal` is far behind and `peak` stays near zero, the headset is not
+converting audio until it receives downlink audio, and `--send-silence` is the
+lever to test.
+
 ## Upload configuration
 
 `/mnt/us/kindle-voice-bridge/upload.json` holds `server_url` and `token`. Write
