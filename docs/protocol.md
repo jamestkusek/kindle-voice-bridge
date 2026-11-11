@@ -15,8 +15,8 @@ on a hosted server.
 ### Provisional and unverified
 
 The following are **design assumptions, not hardware findings**. They must be
-re-checked on the PW4 before any claim of end-to-end success, and this document
-must be revised if they are wrong.
+re-checked on the Paperwhite 10th edition before any claim of end-to-end
+success, and this document must be revised if they are wrong.
 
 | Marker | Assumption | Status |
 |---|---|---|
@@ -846,9 +846,10 @@ loopback uvicorn instance. `parse_wav` may be unit-tested directly.
 
 ### 14.4 What these tests do not prove
 
-No test in this section proves PW4 capture, headset compatibility, HFP/SCO
-routing, the real audio format, Wi-Fi/Bluetooth coexistence, TLS on the Kindle,
-LAN reachability or hosted deployment. Those require hardware and user approval
+No test in this section proves capture on the Paperwhite 10th edition, headset
+compatibility, HFP/SCO routing, the real audio format, Wi-Fi/Bluetooth
+coexistence, TLS on the Kindle, LAN reachability or hosted deployment. Those
+require hardware and user approval
 ([§15](#15-hardware-assumptions-and-open-questions)).
 
 ---
@@ -857,10 +858,10 @@ LAN reachability or hosted deployment. Those require hardware and user approval
 
 Flagged for the hardware workstream; each answer may require a protocol revision.
 
-1. **Actual capture format (P1, P2).** If the PW4/HFP path yields encoded frames,
-   v1's `audio/wav` contract is wrong. Options: decode to PCM in the uploader
-   (preferred, keeps the contract) or add `audio/sbc` in a v2 with its own
-   validation. Do not relabel bytes.
+1. **Actual capture format (P1, P2).** If the HFP path on the Paperwhite 10th
+   edition yields encoded frames, v1's `audio/wav` contract is wrong. Options:
+   decode to PCM in the uploader (preferred, keeps the contract) or add
+   `audio/sbc` in a v2 with its own validation. Do not relabel bytes.
 2. **Real sample rate and bit depth.** If the device produces 16 kHz mono 16-bit,
    nothing changes. If it produces 8-bit or a rate outside 8-48 kHz, revise §7.2.
 3. **Duration limit (P3).** Confirm 15 s is usable end to end, including capture

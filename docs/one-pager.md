@@ -27,7 +27,7 @@ is a real barrier rather than an annoyance.
 ## What I built (MVP)
 
 A feasibility prototype that proves the hard part: getting intelligible
-microphone audio off a Kindle Paperwhite 4 (PW4) and onto a computer.
+microphone audio off a Kindle Paperwhite 10th edition and onto a computer.
 
 - **KOReader plugin (Lua)** — a Voice Bridge menu on the device: run diagnostics,
   inspect Bluetooth, check the bundled Python/Bumble runtime, start and stop the

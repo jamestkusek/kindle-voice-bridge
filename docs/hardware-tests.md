@@ -1,12 +1,12 @@
 # Kindle hardware notes
 
-These results come from a real Kindle PW4. They replace the earlier
-"unverified" framing where a test has since passed. Each section states what was
-observed and what remains unproven.
+These results come from a real Kindle Paperwhite 10th edition. They replace the
+earlier "unverified" framing where a test has since passed. Each section states
+what was observed and what remains unproven.
 
 ## Device
 
-- Model: Kindle Paperwhite 4 (PW4)
+- Model: Kindle Paperwhite 10th edition
 - Firmware: 5.18.1.1.1
 - Architecture: ARMv7
 - C library: glibc 2.20
@@ -70,9 +70,9 @@ Bluetooth restore all completed in one run.
 The Kindle blocks inbound TCP connections. The working direction is Kindle to
 laptop, outbound from the Kindle. The laptop listener accepts that connection.
 
-A Windows firewall inbound rule was required for the listener. The rule is
-scoped to the Kindle's IP address and the project's `python.exe` on port 18767.
-Scope the rule this narrowly; do not open the port to all sources.
+A Windows firewall rule for inbound port 18767 was required for the listener.
+The rule is scoped to the Kindle's IP address and the project's `python.exe` on
+port 18767. Scope the rule this narrowly; do not open the port to all sources.
 
 ## Bluetooth handoff and restoration
 
@@ -109,6 +109,59 @@ The export shape is now confirmed: a `<bt_devices>` root with `<device>`
 elements holding `<bd_addr>`, `<link_key>` and `<key_type>`, with values written
 as colon-separated hex and a trailing colon. The converter parses that shape
 directly and writes both the plain and the `/P` peer key.
+
+## Laptop capture commands
+
+Convert the exported pairing store into a Bumble key store. This headset
+authenticated only with the key bytes reversed:
+
+```powershell
+python tools/kindle_keys_to_bumble.py bt_devices.xml `
+  --reverse-key-bytes -o .data/keys.json
+```
+
+The converter reads the `<bt_devices>` export. It writes each peer under both
+its plain address and the Bumble `AA:BB:CC:DD:EE:FF/P` form. It prints addresses
+only. The listener searches every namespace, so `--namespace` is not needed.
+Write the key store under `.data/`, which `.gitignore` excludes.
+
+Start the laptop listener first. It waits up to 180 seconds for the Kindle:
+
+```powershell
+python tools/hfp_capture.py `
+  --host <laptop-wifi-ip> --port 18767 `
+  --headset <headset-address> --output capture.raw `
+  --keystore .data/keys.json --simulate-call `
+  --acknowledge-controller-reset --acknowledge-unencrypted-hci `
+  --authorize-handoff --authorize-microphone-recording
+```
+
+The four `--acknowledge-*` and `--authorize-*` flags are required. Wait for
+`The HCI listener is ready.` before the next step on the Kindle.
+
+The listener records five seconds of usable audio to `capture.raw`. It writes
+the packet metadata to `capture.raw.json` next to the file. Convert the capture:
+
+```powershell
+python tools/raw_to_wav.py capture.raw 8000 capture.wav
+python tools/clean_raw_wav.py capture.raw 8000 capture-clean.wav
+```
+
+`clean_raw_wav.py` removes the DC offset and normalises the peak.
+`hfp_capture.py` holds packets until a 0.40 s window looks like live audio. It
+then records the requested five seconds of usable audio. The JSON sidecar
+records the settle time, the discarded packet count, and the criterion values.
+If the stream never settles within 10 seconds, the capture fails and writes no
+audio. `--no-settle` restores the old fixed five-second behaviour. On those
+files, add `--start 2.4` to `clean_raw_wav.py` to trim the artifact by hand. The
+format is PCM16 mono 8 kHz by strong inference. The controller has not confirmed
+the format. The detector assumes that format.
+
+To check the detector against an existing capture without touching it:
+
+```powershell
+python tools/replay_settle.py .data/capture3.raw .data/capture.raw
+```
 
 ## Captures
 
@@ -172,6 +225,105 @@ microphone was live all along and the earlier loss was something else. If
 `first signal` is far behind and `peak` stays near zero, the headset is not
 converting audio until it receives downlink audio, and `--send-silence` is the
 lever to test.
+
+### Send-silence experiment
+
+Some handsets start the microphone only after they receive downlink audio.
+`--send-silence` sends paced silent PCM downlink packets during each capture.
+The option is off by default, so the current behaviour is reproducible.
+
+Start one session with the option:
+
+```sh
+cd /mnt/us/kindle-voice-bridge
+PYTHONHOME=/mnt/us/kindle-voice-bridge/python31117 \
+PYTHONPATH=/mnt/us/kindle-voice-bridge/bumble \
+LD_LIBRARY_PATH=/mnt/us/kindle-voice-bridge/python31117/lib \
+/mnt/us/kindle-voice-bridge/python31117/bin/python3.11 -u -B \
+  bt_session.py --config upload.json --send-silence \
+  --authorize-bluetooth-handoff --authorize-microphone-recording \
+  --confirm-bluetooth-enabled-in-ui
+```
+
+Then select **Record and send** in the plugin. The plugin shows
+"Preparing the microphone…" when the run starts. In a Bluetooth session, it
+replaces that message with a recording prompt when the settle detector accepts
+audio. Each recording writes one line to the daemon log. When the plugin starts
+the session, the log is `bt-session.log`:
+
+```text
+Record: silence on, kept 5.00 s, settle 2.10 s, 2.55 s after the SCO link opened.
+```
+
+Compare that line with a run without `--send-silence`. The one-shot path has the
+same flag:
+
+```sh
+cd /mnt/us/kindle-voice-bridge
+PYTHONHOME=/mnt/us/kindle-voice-bridge/python31117 \
+PYTHONPATH=/mnt/us/kindle-voice-bridge/bumble \
+LD_LIBRARY_PATH=/mnt/us/kindle-voice-bridge/python31117/lib \
+/mnt/us/kindle-voice-bridge/python31117/bin/python3.11 -u -B \
+  capture_local.py --config upload.json --send-silence \
+  --authorize-bluetooth-handoff --authorize-microphone-recording \
+  --confirm-bluetooth-enabled-in-ui
+```
+
+The one-shot path prints `Downlink silence used: yes`, the settle time, and the
+settle time measured from the SCO link open.
+
+## Resident session protocol
+
+The daemon listens on the Unix domain socket
+`/tmp/voicebridge-bt-session.sock`. The socket mode is 0600. On Linux the daemon
+also checks `SO_PEERCRED` and accepts only the same user ID. The Kindle kernel
+4.1 supports `AF_UNIX`. All Kindle processes may run as root, so the owner check
+is weak on this device. Do not expose the socket over the network.
+
+The protocol is one ASCII line in and one ASCII line out. The client sends
+`start_recording`, `stop_recording`, `record`, `status`, `phase`, `state`,
+`result`, or `stop`.
+
+- `start_recording` replies `ok recording` only after SCO is open and the audio
+  callback is installed.
+- `stop_recording` stops the capture, uploads once, and returns the result.
+- `record` is the fixed-duration convenience path.
+- `status` and `phase` report `idle`, `preparing`, `recording`, `sending`, or
+  `stopping`. For a manual capture, `recording` means that SCO is ready. It does
+  not mean that the settle detector accepted audio.
+- `result` retrieves the latest result after the automatic 15 s stop and send.
+- `state` returns `ok <phase> <elapsed_ms> <remaining_ms> <link> <result>`. The
+  two clocks are `-1` when the capture length is not known in advance. This is
+  the case for the legacy `record` command. `result` is `-` until a recording
+  finishes. The recording page of the plugin reads the same fields from a file.
+- `stop` replies `ok stopping`. The daemon restores Bluetooth and exits.
+- The daemon handles each control command in its own task. A `stop` command
+  waits for a running upload. A `status` or `phase` command can time out during
+  an upload.
+
+While the session runs, the daemon rewrites
+`/tmp/voicebridge-bt-session.state` every 100 ms. The format is
+`v1 <heartbeat> <phase> <elapsed_ms> <remaining_ms> <link> <result>`. The mode
+is 0600. The heartbeat counts up on every write, so a reader can tell a live
+session from a stale file. The plugin polls this file instead of spawning a
+client process for every update. The daemon removes the file when it stops.
+
+The client mode uses only the Python standard library:
+
+```sh
+... bt_session.py --client status
+... bt_session.py --client phase
+... bt_session.py --client state
+... bt_session.py --client start_recording
+... bt_session.py --client stop_recording
+... bt_session.py --client record
+... bt_session.py --client stop
+```
+
+The daemon reads `upload.json` and keeps the file for later sessions. The plugin
+shows the daemon reply. The plugin uses the daemon for **Record and send** when
+a session runs. The plugin uses the one-shot `capture_local.py` path when no
+session runs.
 
 ## Upload configuration
 
