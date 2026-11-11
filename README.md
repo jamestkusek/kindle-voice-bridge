@@ -52,6 +52,24 @@ network only and read [docs/review-ui.md](docs/review-ui.md) for the detail.
 The Kindle has no system Python. The commands `python3` and `python` are not
 present on the device.
 
+### Device runtime (one-time)
+
+Connect the USB cable; the Kindle mounts as a drive. Copy these two trees there
+once. `deploy` does not copy them.
+
+| What | Where on the Kindle |
+|---|---|
+| Portable CPython 3.11.17 (ARMv7, glibc 2.20) | `/mnt/us/kindle-voice-bridge/python31117/` |
+| Bumble 0.0.236 and its pure-Python dependencies | `/mnt/us/kindle-voice-bridge/bumble/` |
+
+The exact wheel set and versions are pinned in
+[docs/bumble-bundle-manifest.txt](docs/bumble-bundle-manifest.txt). Check a
+staged bundle on the computer with:
+
+```powershell
+python tools/verify_bumble_bundle.py --bundle build/bumble-kindle
+```
+
 ## 1. Jailbreak the Kindle and install KOReader
 
 The [jailbreak guide](https://kindlemodding.org/jailbreaking/index.html) covers
