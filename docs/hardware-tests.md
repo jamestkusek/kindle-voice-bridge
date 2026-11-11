@@ -34,18 +34,13 @@ link key means the controller performs authentication.
 
 These plugin actions work on the device:
 
-- Run diagnostics
-- Inspect Bluetooth
-- Start recording
-- Stop & send
-- Start HCI probe
-- Stop HCI probe
-- Record and send
-- Export Bluetooth link keys
+- Start Bluetooth session
+- Stop Bluetooth session
+- Ask question
 
 The resident Bluetooth session has been deployed. The operator reports one
 Bluetooth handoff at session start and multiple recordings without Bluetooth
-disconnects. The manual Start recording / Stop & send path has not been
+disconnects. The manual Ask question path has not been
 hardware-tested. Offline tests use fakes and do not touch the device.
 
 That path now opens a strip along the bottom edge, driven by the daemon's state
@@ -61,8 +56,8 @@ sent a generated WAV to the Windows receiver over Wi-Fi. The plugin no longer
 exposes that test as a menu action; the upload path is verified end to end but
 is not part of the HCI flow.
 
-The **Record and send** action and `kindle/voice_bridge/capture_local.py` have
-now run the full chain on the device. Bumble's `serial:` transport on
+The one-shot `kindle/voice_bridge/capture_local.py` path has now run the full
+chain on the device. Bumble's `serial:` transport on
 `/dev/ttymxc2`, Bumble and the Audio Gateway on ARMv7, and the upload after the
 Bluetooth restore all completed in one run.
 
@@ -246,11 +241,10 @@ LD_LIBRARY_PATH=/mnt/us/kindle-voice-bridge/python31117/lib \
   --confirm-bluetooth-enabled-in-ui
 ```
 
-Then select **Record and send** in the plugin. The plugin shows
-"Preparing the microphone…" when the run starts. In a Bluetooth session, it
-replaces that message with a recording prompt when the settle detector accepts
-audio. Each recording writes one line to the daemon log. When the plugin starts
-the session, the log is `bt-session.log`:
+Then select **Ask question** in the plugin. The strip shows **PREPARING** while
+SCO opens, then **SPEAK NOW** when the microphone is converting audio. Each
+recording writes one line to the daemon log. When the plugin starts the session,
+the log is `bt-session.log`:
 
 ```text
 Record: silence on, kept 5.00 s, settle 2.10 s, 2.55 s after the SCO link opened.
@@ -322,9 +316,8 @@ The client mode uses only the Python standard library:
 ```
 
 The daemon reads `upload.json` and keeps the file for later sessions. The plugin
-shows the daemon reply. The plugin uses the daemon for **Record and send** when
-a session runs. The plugin uses the one-shot `capture_local.py` path when no
-session runs.
+uses the daemon for every recording. It no longer uses the one-shot
+`capture_local.py` path.
 
 ## Upload configuration
 

@@ -35,28 +35,20 @@ The commands for the key conversion, the listener, and the WAV conversion are in
 [hardware-tests.md](hardware-tests.md). Start the listener first. Wait for
 `The HCI listener is ready.` before the step on the Kindle.
 
-On the Kindle, open the Voice Bridge plugin. Select **Start HCI probe**. The
-Kindle opens an outbound connection to the laptop, transfers the Bluetooth UART,
-and relays raw H:4. Bluetooth drops twice per run by design, and the supervisor restores it
-afterwards. Use **Stop HCI probe** if the run does not end on its own.
+The HCI probe is not in the plugin menu. Run `launch_hci.py` on the device from a
+shell. The Kindle opens an outbound connection to the laptop, transfers the
+Bluetooth UART, and relays raw H:4. Bluetooth drops twice per run by design, and
+the supervisor restores it afterwards.
 
-The plugin exposes these actions:
+The plugin exposes three actions:
 
-- Run diagnostics
-- Inspect Bluetooth
-- Check Bumble runtime
 - Start Bluetooth session
 - Stop Bluetooth session
-- Start recording
-- Stop & send
-- Record and send
-- Start HCI probe
-- Stop HCI probe
-- Export Bluetooth link keys
+- Ask question
 
-Start Bluetooth session, Record and send, Start HCI probe, and Export ask for
-confirmation first. The other actions only read device state or stop a running
-session.
+Start Bluetooth session asks for confirmation. The other two act immediately.
+**Ask question** opens the strip along the bottom edge. Tap the strip to stop and
+send.
 
 ## Device side
 
@@ -92,8 +84,7 @@ key. It wrote a 5.003 s WAV, and the receiver stored the file.
 The settle detector worked in that run. The recording started clean with no
 leading DC artifact. The mean was -0.8, and speech started at 0.21 s.
 
-Run the capture from a device shell, or select **Record and send** in the
-plugin:
+Run the capture from a device shell. The plugin no longer exposes it:
 
 ```sh
 cd /mnt/us/kindle-voice-bridge
@@ -120,8 +111,7 @@ not call `power_on` again, and does not restore Bluetooth between recordings.
 Bluetooth drops once at session start and once at session end.
 
 The operator reported that the single handoff and the repeated recordings work
-on the device. The manual path with Start recording and Stop & send has produced
-recordings and uploads on the device. The first runs cued the operator too
+on the device. The manual path has produced recordings and uploads on the device. The first runs cued the operator too
 early, so the start of the speech was lost. The current detector has not been
 tested on hardware. The offline tests use fakes and do not touch Bluetooth
 hardware.
@@ -149,7 +139,7 @@ Start one session at a time. A second start fails before the Bluetooth handoff.
 
 ### Manual recording strip
 
-- Select **Start recording** after the session starts. A strip opens along the
+- Select **Ask question** after the session starts. A strip opens along the
   bottom edge of the screen.
 - The strip does not cover the page. The reader stays usable, and a tap outside
   the strip still turns the page.
@@ -170,8 +160,6 @@ Start one session at a time. A second start fails before the Bluetooth handoff.
   cue.
 - The daemon waits up to 4 s for a signal. If no signal appears, it cues anyway
   and records from that point.
-- **Record and send** stays as the fixed five-second action. It does not open
-  the strip.
 
 ### Control protocol
 
@@ -199,9 +187,8 @@ A client process takes several seconds to start on the device, which is longer
 than the capture can wait.
 
 The daemon reads `upload.json` and keeps the file for later sessions. The plugin
-shows the daemon reply. The plugin uses the daemon for **Record and send** when
-a session runs. The plugin uses the one-shot `capture_local.py` path when no
-session runs.
+uses the daemon for every recording. It no longer uses the one-shot
+`capture_local.py` path.
 
 ### Capture latency experiment
 

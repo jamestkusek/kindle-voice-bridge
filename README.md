@@ -95,15 +95,11 @@ To write the file by hand, create it with this content:
 
 1. Open the Voice Bridge plugin in KOReader.
 2. Select **Start Bluetooth session**. Confirm the action.
-3. Select **Start recording**. A strip opens along the bottom edge of the
-   screen.
+3. Select **Ask question**. A strip opens along the bottom edge of the screen.
 4. Wait for **SPEAK NOW** and the countdown.
-5. Tap the strip to stop and send. The strip shows **SENDING**, then **SENT**
-   or **NOT SENT**.
-6. Tap the strip again to close it.
-
-**Record and send** records a fixed five-second clip and does not open the
-strip.
+5. Ask the question, then tap the strip to stop and send.
+6. The strip shows **SENT**, then **RESPONSE READY** when the answer arrives.
+7. Tap the strip to read the answer. Closing the popup closes the strip.
 
 ## Where to go next
 
