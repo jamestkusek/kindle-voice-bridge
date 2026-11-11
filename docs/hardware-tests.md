@@ -48,7 +48,8 @@ Bluetooth handoff at session start and multiple recordings without Bluetooth
 disconnects. The manual Start recording / Stop & send path has not been
 hardware-tested. Offline tests use fakes and do not touch the device.
 
-That path now opens a full-screen page driven by the daemon's state file. The
+That path now opens a strip along the bottom edge, driven by the daemon's state
+file. The
 page logic is covered by `tests/koreader/voicebridge_spec.lua`, which stubs the
 KOReader widgets and drives the page through preparing, recording, stopping,
 sent, failed, capped and stale states. The spec does not test how the page looks

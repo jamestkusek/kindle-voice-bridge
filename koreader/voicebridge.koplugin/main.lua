@@ -5,6 +5,8 @@ local Font = require("ui/font")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
+local HorizontalGroup = require("ui/widget/horizontalgroup")
+local HorizontalSpan = require("ui/widget/horizontalspan")
 local InfoMessage = require("ui/widget/infomessage")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local Screen = require("device").screen
@@ -867,9 +869,10 @@ local function read_state(path)
     }
 end
 
+-- A strip along the bottom edge. It does not cover the page, so the reader
+-- stays usable and taps outside the strip still turn pages.
 local RecordPage = InputContainer:extend{
     name = "voicebridge_record_page",
-    covers_fullscreen = true,
     phase = "waiting",
     remaining_ms = -1,
     result = nil,
@@ -883,8 +886,12 @@ local RecordPage = InputContainer:extend{
 }
 
 function RecordPage:init()
+    local height = Screen:scaleBySize(64)
     self.dimen = Geom:new{
-        x = 0, y = 0, w = Screen:getWidth(), h = Screen:getHeight(),
+        x = 0,
+        y = Screen:getHeight() - height,
+        w = Screen:getWidth(),
+        h = height,
     }
     self.ges_events = {
         TapStop = {
@@ -892,6 +899,12 @@ function RecordPage:init()
         },
     }
     self:build()
+end
+
+function RecordPage:paintTo(bb, _x, _y)
+    -- The strip always sits on the bottom edge, whatever position the window
+    -- manager passes, so the layout does not depend on show() position support.
+    InputContainer.paintTo(self, bb, self.dimen.x, self.dimen.y)
 end
 
 function RecordPage:is_live()
@@ -924,13 +937,13 @@ end
 function RecordPage:hint_word()
     local phase = self.phase
     if phase == "recording" then
-        return _("Tap anywhere to stop and send")
+        return _("Tap the bar to stop and send")
     elseif phase == "preparing" then
         return _("Opening the microphone…")
     elseif phase == "sending" or phase == "stopping" then
         return _("Uploading the recording…")
     elseif self:is_finished() then
-        return _("Tap anywhere to close")
+        return _("Tap the bar to close")
     end
     return _("Waiting for the session…")
 end
@@ -947,7 +960,8 @@ end
 function RecordPage:build()
     local width = self.dimen.w
     local height = self.dimen.h
-    local padding = Screen:scaleBySize(24)
+    local padding = Screen:scaleBySize(10)
+    local gap = Screen:scaleBySize(14)
     local max_width = width - padding * 2
     local live = self:is_live()
     local background = live and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE
@@ -955,40 +969,48 @@ function RecordPage:build()
 
     self.state_text = TextWidget:new{
         text = self:state_word(),
-        face = Font:getFace("cfont", 56),
+        face = Font:getFace("cfont", 20),
         bold = true,
         fgcolor = foreground,
         max_width = max_width,
     }
     self.count_text = TextWidget:new{
         text = self:count_word(),
-        face = Font:getFace("cfont", 96),
+        face = Font:getFace("cfont", 30),
         bold = true,
         fgcolor = foreground,
         max_width = max_width,
     }
     self.hint_text = TextWidget:new{
         text = self:hint_word(),
-        face = Font:getFace("cfont", 16),
+        face = Font:getFace("cfont", 12),
         fgcolor = foreground,
         max_width = max_width,
     }
     self.result_text = TextWidget:new{
         text = self:result_word(),
-        face = Font:getFace("cfont", 16),
+        face = Font:getFace("cfont", 12),
         fgcolor = foreground,
         max_width = max_width,
     }
+
+    self.top_group = HorizontalGroup:new{
+        align = "center",
+        self.state_text,
+        HorizontalSpan:new{ width = gap },
+        self.count_text,
+    }
+    self.bottom_group = HorizontalGroup:new{
+        align = "center",
+        self.hint_text,
+        HorizontalSpan:new{ width = gap },
+        self.result_text,
+    }
     self.group = VerticalGroup:new{
         align = "center",
-        VerticalSpan:new{ width = math.floor(height * 0.16) },
-        self.state_text,
-        VerticalSpan:new{ width = padding },
-        self.count_text,
-        VerticalSpan:new{ width = padding },
-        self.hint_text,
-        VerticalSpan:new{ width = padding },
-        self.result_text,
+        self.top_group,
+        VerticalSpan:new{ width = Screen:scaleBySize(4) },
+        self.bottom_group,
     }
     self[1] = FrameContainer:new{
         background = background,
@@ -1010,7 +1032,7 @@ function RecordPage:rebuild()
 end
 
 function RecordPage:start()
-    UIManager:show(self, "full")
+    UIManager:show(self, "ui", self.dimen, self.dimen.x, self.dimen.y)
     self:scheduleTick()
 end
 
@@ -1118,7 +1140,7 @@ function RecordPage:set_phase(phase)
     end
     self.phase = phase
     self:rebuild()
-    UIManager:setDirty(self, "full")
+    UIManager:setDirty(self, "ui", self.dimen)
 end
 
 function RecordPage:refresh_count()
@@ -1126,8 +1148,9 @@ function RecordPage:refresh_count()
     local text = self:count_word()
     if text == self.count_text.text then return end
     self.count_text:setText(text)
+    self.top_group:resetLayout()
     self.group:resetLayout()
-    UIManager:setDirty(self, "ui")
+    UIManager:setDirty(self, "ui", self.dimen)
 end
 
 function RecordPage:finish(kind, result)
@@ -1135,7 +1158,7 @@ function RecordPage:finish(kind, result)
     self.phase = kind
     self.result = result
     self:rebuild()
-    UIManager:setDirty(self, "full")
+    UIManager:setDirty(self, "ui", self.dimen)
 end
 
 function RecordPage:finish_result(reply)
@@ -1160,7 +1183,7 @@ function RecordPage:request_stop()
     self.stop_ticks = 0
     self.phase = "stopping"
     self:rebuild()
-    UIManager:setDirty(self, "full")
+    UIManager:setDirty(self, "ui", self.dimen)
     if not self:spawn_stop() then
         self:finish("failed", _("The plugin could not start Stop & send."))
     end
@@ -1169,7 +1192,7 @@ end
 function RecordPage:onTapStop()
     if self:is_finished() then
         self.closed = true
-        UIManager:close(self)
+        UIManager:close(self, "ui", self.dimen)
         return
     end
     if self.stop_requested then return end

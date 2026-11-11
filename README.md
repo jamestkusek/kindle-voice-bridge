@@ -275,20 +275,23 @@ paced silent downlink audio during each capture. The default is off.
 
 Start one session at a time. A second start fails before the Bluetooth handoff.
 
-### Manual recording page
+### Manual recording bar
 
-- Select **Start recording** after the session starts. A full-screen page opens.
-- The page shows **PREPARING** while SCO opens. It then changes to a black page
-  with **SPEAK NOW** and a countdown from 15.
-- Tap anywhere to stop and send. The page shows **SENDING**, then **SENT** or
-  **NOT SENT** with the result. Tap again to close.
-- The daemon drives the page. The plugin does not use its own clock.
+- Select **Start recording** after the session starts. A strip opens along the
+  bottom edge of the screen.
+- The strip does not cover the page. The reader stays usable, and a tap outside
+  the strip still turns the page.
+- The strip shows **PREPARING** while SCO opens. It then changes to a black
+  strip with **SPEAK NOW** and a countdown from 15.
+- Tap the strip to stop and send. The strip shows **SENDING**, then **SENT** or
+  **NOT SENT** with the result. Tap the strip again to close it.
+- The daemon drives the strip. The plugin does not use its own clock.
 - **SPEAK NOW** appears only after the daemon detects that the microphone is
   converting audio. SCO open is not sufficient, because the receive path
   delivers about 2.5 s of startup artifact before usable audio. The countdown
   is the remaining time from the daemon.
-- The page shows **NO SESSION** when the daemon stops writing the state file. It
-  does not show a stale countdown.
+- The strip shows **NO SESSION** when the daemon stops writing the state file.
+  It does not show a stale countdown.
 - The capture stores packets from the first callback and does not use the
   settle detector. The daemon trims every packet before the cue, so the file
   starts where the microphone became live. The 15 s cap counts only audio after
@@ -296,7 +299,7 @@ Start one session at a time. A second start fails before the Bluetooth handoff.
 - The daemon waits up to 4 s for a signal. If no signal appears, it cues
   anyway and records from that point.
 - **Record and send** stays as the fixed five-second action. It does not open
-  the page.
+  the strip.
 
 ### Control protocol
 

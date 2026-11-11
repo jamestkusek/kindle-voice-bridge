@@ -68,7 +68,11 @@ function TextWidget:setText(text) self.text = text end
 local VerticalGroup = derive(WidgetContainer, {})
 function VerticalGroup:resetLayout() self._size = nil end
 
+local HorizontalGroup = derive(WidgetContainer, {})
+function HorizontalGroup:resetLayout() self._size = nil end
+
 local VerticalSpan = derive(Widget, {})
+local HorizontalSpan = derive(Widget, {})
 local FrameContainer = derive(WidgetContainer, {})
 
 local Screen = {
@@ -121,6 +125,8 @@ install("ui/widget/container/framecontainer", FrameContainer)
 install("ui/widget/textwidget", TextWidget)
 install("ui/widget/verticalgroup", VerticalGroup)
 install("ui/widget/verticalspan", VerticalSpan)
+install("ui/widget/horizontalgroup", HorizontalGroup)
+install("ui/widget/horizontalspan", HorizontalSpan)
 install("ui/geometry", Geom)
 install("ui/gesturerange", GestureRange)
 install("ui/font", Font)
@@ -286,7 +292,7 @@ equal(page:state_word(), "NO SESSION", "stale word")
 page:onTapStop()
 check(UIManager.closed_widget == page, "a tap closes a finished page")
 
--- 12. The full-screen page inverts only while the microphone is live.
+-- 12. The bar inverts only while the microphone is live.
 publish("preparing", -1, -1)
 page = new_page()
 page:tick()
@@ -294,6 +300,16 @@ equal(page[1].background, "white", "preparing is not inverted")
 publish("recording", 100, 14900)
 page:tick()
 equal(page[1].background, "black", "recording inverts the page")
+
+-- 13. The widget is a strip on the bottom edge, not a full-screen page.
+page = new_page()
+check(page.dimen.h < Screen:getHeight(), "the bar does not cover the page")
+equal(page.dimen.y + page.dimen.h, Screen:getHeight(),
+    "the bar sits on the bottom edge")
+equal(page.dimen.w, Screen:getWidth(), "the bar spans the width")
+check(page.covers_fullscreen ~= true, "the bar is not marked fullscreen")
+equal(page.ges_events.TapStop[1].range.h, page.dimen.h,
+    "the tap range is the bar height")
 
 os.remove(STATE)
 os.remove(STATE .. ".bad")
