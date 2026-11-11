@@ -36,10 +36,24 @@ These plugin actions work on the device:
 
 - Run diagnostics
 - Inspect Bluetooth
+- Start recording
+- Stop & send
 - Start HCI probe
 - Stop HCI probe
 - Record and send
 - Export Bluetooth link keys
+
+The resident Bluetooth session has been deployed. The operator reports one
+Bluetooth handoff at session start and multiple recordings without Bluetooth
+disconnects. The manual Start recording / Stop & send path has not been
+hardware-tested. Offline tests use fakes and do not touch the device.
+
+That path now opens a full-screen page driven by the daemon's state file. The
+page logic is covered by `tests/koreader/voicebridge_spec.lua`, which stubs the
+KOReader widgets and drives the page through preparing, recording, stopping,
+sent, failed, capped and stale states. The spec does not test how the page looks
+on e-ink: the partial refresh cost of a 1 Hz countdown, and whether the
+inverted page ghosts, are unmeasured on the device.
 
 The upload path was verified separately: `kindle/voice_bridge/test_upload.py`
 sent a generated WAV to the Windows receiver over Wi-Fi. The plugin no longer
@@ -121,7 +135,26 @@ uploaded the file to the receiver. The receiver stored a 5.003 s mono 8 kHz
 
 The settle detector worked live. The leading DC/frozen-spectrum artifact is
 gone and the recording starts clean: mean -0.8, no DC offset, speech from
-0.21 s.
+0.21 s. The resident manual path deliberately skips that detector: it records
+from SCO readiness, for up to 15 seconds, and may include startup artifact or
+silence at the beginning. That manual path remains unverified on hardware.
+
+Its user interface is unverified too. The daemon publishes
+`/tmp/voicebridge-bt-session.state` every 100 ms, and the plugin repaints the
+page from that file. A hardware run should confirm three things: that **SPEAK
+NOW** appears within about a second of the microphone going live, that the
+countdown matches the real remaining time, and that the page does not ghost
+badly after 15 one-second partial refreshes.
+
+## Upload configuration
+
+`/mnt/us/kindle-voice-bridge/upload.json` holds `server_url` and `token`. Write
+it once. `capture_local.py` and `bt_session.py` read it and leave it in place,
+so later runs and sessions reuse it.
+
+The bearer token therefore persists on the device in plain text on a FAT
+filesystem. That is acceptable only for the trusted-LAN prototype. Delete the
+file when testing is finished.
 
 ## Remaining known issues
 
@@ -131,8 +164,12 @@ gone and the recording starts clean: mean -0.8, no DC offset, speech from
 - Bandwidth is narrow: 99% of the energy sits below 1,474 Hz, so sibilants are
   weak.
 - The settle took 6.61 s on the device versus 2.4 s on the laptop. A run takes
-  roughly 11 s of wall-clock for 5 s of audio.
-- Bluetooth still drops twice per run.
+  roughly 11 s of wall-clock for 5 s of audio. The device may start its
+  microphone only after it receives downlink audio. `--send-silence` tests that
+  hypothesis. The option is off by default and has not run on hardware.
+- The one-shot path still hands Bluetooth off and restores it per run. The
+  resident session is reported to hand off once and preserve the link across
+  multiple recordings; the new manual audio path is not hardware-verified.
 - The earlier captures began with a non-speech artifact, likely a stale or
   unfed SCO receive buffer. The on-device run did not show it.
   `tools/hfp_capture.py` discards it: a 0.40 s sliding window must show a small

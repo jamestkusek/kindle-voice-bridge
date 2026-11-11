@@ -42,11 +42,25 @@ The list response has this shape:
       "sample_rate_hz": 8000,
       "channels": 1,
       "bits_per_sample": 16,
-      "parse_error": null
+      "parse_error": null,
+      "transcript": {
+        "status": "ok",
+        "text": "Speak now. Fifteen, fourteen.",
+        "model": "mistralai/voxtral-small-24b-2507",
+        "attempts": 1,
+        "error": null,
+        "retryable": false,
+        "cost_usd": 0.0015,
+        "updated_at": "2026-11-11T12:00:00+00:00"
+      }
     }
   ]
 }
 ```
+
+`transcript` is `null` when no sidecar exists. The sidecar is written by the
+receiver (see [transcription.md](transcription.md)); this page only reads it, and
+re-types and caps every field so a corrupt sidecar cannot bloat the listing.
 
 Metadata is derived by parsing each file with
 `voice_bridge_server.audio.parse_wav`, so there is no second WAV parser. A file
@@ -59,9 +73,16 @@ as `null`.
 - Each row shows the ID, received time, duration, sample rate, channels, bit
   depth, file size and the first 12 hex characters of the SHA-256.
 - `<audio controls>` plays the clip inline; a Download link saves it.
-- Delete asks for confirmation, then removes the file and refreshes the list.
-- A Refresh button and the `R` key reload the list. There is no polling,
-  WebSocket or auto-refresh loop.
+- Delete asks for confirmation, then removes the file, its transcript sidecars
+  and refreshes the list.
+- The transcript appears under the player, with the model, the attempt count and
+  the billed cost on one muted line. A failed transcription shows the error
+  instead. A recording with no sidecar yet shows "Transcribing…".
+- A Refresh button and the `R` key reload the list.
+- The page polls every 2 seconds **only while a transcript is pending**, and
+  stops on its own. A recording with no sidecar counts as pending only for its
+  first 60 seconds, so a storage directory from before transcription was
+  enabled does not poll forever. There is still no WebSocket.
 
 ## Security model
 
