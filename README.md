@@ -51,11 +51,13 @@ network only and read [docs/review-ui.md](docs/review-ui.md) for the detail.
 
 The Kindle has no system Python. The commands `python3` and `python` are not
 present on the device.
+## Setup
 
-### Device runtime (one-time)
+### Preliminary: Install runtimes on Kindle 
 
-Connect the USB cable; the Kindle mounts as a drive. Copy these two trees there
-once. `deploy` does not copy them.
+This needs to be done once, so that the Kindle can run the code to capture audio from the bluetooth headset and send it to the server.
+
+Connect the Kindle to your PC via USB Copy these two directories as described below.
 
 | What | Where on the Kindle |
 |---|---|
@@ -72,9 +74,7 @@ python tools/verify_bumble_bundle.py --bundle build/bumble-kindle
 
 ## 1. Jailbreak the Kindle and install KOReader
 
-The [jailbreak guide](https://kindlemodding.org/jailbreaking/index.html) covers
-the jailbreak and the KOReader install. This project assumes a jailbroken
-Kindle with KOReader already running.
+The Kindle Modding community provides a clear guide on how to jailbreak your kindle to install KOReader, which is the reader where the plugin lives. [jailbreak guide](https://kindlemodding.org/jailbreaking/index.html)
 
 ## 2. Install the receiver
 
@@ -90,10 +90,10 @@ python -m pip install -e .
 .\tools\kvb.ps1 receiver
 ```
 
-The health check is at `http://127.0.0.1:18767/healthz`. The dashboard is at
-`http://127.0.0.1:18767/`.
+The health check is at `http://127.0.0.1:18767/healthz`. The dashboard is hosted at
+`http://127.0.0.1:18767/` and allows us to monitor transcription, questions and answers from/to the Kindle.
 
-The command creates a token when none exists and never prints it. It stores
+The server stores
 recordings in `%LOCALAPPDATA%\KindleVoiceBridge\recordings`. It turns
 transcription and answering on when
 `server/voice_bridge_server/voxtral-openrouter-key.txt` exists.
@@ -113,29 +113,23 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\kvb.ps1 receiver
 
 ## 4. Connect the Kindle and copy the files
 
-1. Connect the USB cable.
-2. Run this command with the drive letter of the Kindle:
+1. Connect the Kindle to your PC with a USB cable.
+2. Run this command with the drive letter of the Kindle (normally D, as shown in the commmand):
 
    ```powershell
    .\tools\kvb.ps1 deploy -KindleRoot D:\ -ServerUrl http://<laptop-ip>:18767
    ```
 
-The command copies the device files and the KOReader plugin. It does not copy
-the Python runtime or the Bumble bundle.
+The command copies the code holding the KOReader plugin and the logic needed to capture and send bluetooth audio from a connected bluetooth device.
 
-## 5. Write the upload configuration
+It also writes `/mnt/us/kindle-voice-bridge/upload.json`, which holds
+`server_url` and `token`, so the Kindle knows where to upload and how to
+authenticate. If the laptop's LAN IP changes, rerun the command with the new
+`-ServerUrl` and `-Force`. Without `-ServerUrl`, deploy leaves the existing file
+alone. The token is in `.data\receiver-config.json` if you need to edit the file
+by hand.
 
-The device reads `/mnt/us/kindle-voice-bridge/upload.json`, which holds
-`server_url` and `token`. The `deploy` command writes the file when
-`-ServerUrl` is present. Add `-Force` to replace an existing file.
-
-To write the file by hand, create it with this content:
-
-```json
-{"server_url": "http://<laptop-ip>:18767", "token": "<token>"}
-```
-
-## 6. Make the first recording
+## 5. Make the first recording
 
 1. Open the Voice Bridge plugin in KOReader.
 2. Select **Start Bluetooth session**. Confirm the action.
