@@ -15,14 +15,14 @@ Safety rules enforced here:
 * the resolved path is checked to stay inside the configured storage directory;
 * metadata is derived with :func:`voice_bridge_server.audio.parse_wav`, so there
   is no second WAV parser to keep in sync;
-* the page renders every value with DOM text nodes, never with ``innerHTML``.
+* the page renders every value with DOM text nodes, never with ``innerHTML``;
+* the page polls only while a transcript is still pending, and stops on its own.
 """
 
 from __future__ import annotations
 
 import hashlib
 import pathlib
-import re
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request
@@ -35,12 +35,14 @@ from fastapi.responses import (
 
 from .audio import WavError, parse_wav
 from .config import Settings
-
-#: The exact ID format from ``docs/protocol.md`` §9.2. ``fullmatch`` is used so
-#: no prefix, suffix, separator or path component can slip through.
-RECORDING_ID_PATTERN = re.compile(r"rec_[0-9]{8}T[0-9]{6}Z_[0-9a-f]{32}")
+from .storage import RECORDING_ID_PATTERN
+from .transcripts import read_sidecar, transcript_paths
 
 _SHA_PREFIX_CHARS = 12
+#: A sidecar is written by the receiver, but the page still caps what it will
+#: echo so a corrupt or hand-edited file cannot bloat the listing.
+_TRANSCRIPT_TEXT_LIMIT = 4000
+_TRANSCRIPT_ERROR_LIMIT = 500
 #: A stored clip was validated against the upload limit when it arrived. The
 #: review listing only reports statistics, so it parses with a generous finite
 #: limit instead of the current setting. A recording that is longer than the
@@ -130,7 +132,11 @@ def list_recordings(storage_dir: pathlib.Path) -> list[dict[str, object]]:
 def delete_recording(
     storage_dir: pathlib.Path, recording_id: str
 ) -> None:
-    """Delete one stored recording, or raise a specific error."""
+    """Delete one stored recording and its sidecars, or raise a specific error.
+
+    The transcript sidecars belong to the recording, so leaving them behind
+    would accumulate orphaned files in the storage directory.
+    """
 
     path = recording_path(storage_dir, recording_id)
     try:
@@ -139,6 +145,14 @@ def delete_recording(
         raise RecordingNotFound(recording_id) from exc
     except OSError as exc:
         raise RecordingDeleteFailed(recording_id) from exc
+
+    for sidecar in transcript_paths(path):
+        try:
+            sidecar.unlink()
+        except OSError:
+            # The recording is already gone. A sidecar that cannot be removed
+            # is not a reason to report the delete as failed.
+            pass
 
 
 def register_review_routes(app: FastAPI, settings: Settings) -> None:
@@ -260,6 +274,7 @@ def _describe_recording(
         "channels": None,
         "bits_per_sample": None,
         "parse_error": None,
+        "transcript": _transcript_summary(path),
     }
 
     try:
@@ -277,6 +292,38 @@ def _describe_recording(
         item["bits_per_sample"] = info.bits_per_sample
 
     return stat.st_mtime, item
+
+
+def _transcript_summary(path: pathlib.Path) -> dict[str, object] | None:
+    """Return the transcript sidecar for one recording, or ``None``.
+
+    The sidecar is written by the receiver, but every field is re-typed and
+    capped here so the page never renders an unexpected shape.
+    """
+
+    sidecar = read_sidecar(path)
+    if sidecar is None:
+        return None
+
+    def text(value: object, limit: int) -> str | None:
+        if not isinstance(value, str):
+            return None
+        return value if len(value) <= limit else value[: limit - 1] + "…"
+
+    usage = sidecar.get("usage")
+    cost = usage.get("cost") if isinstance(usage, dict) else None
+    attempts = sidecar.get("attempts")
+    status = sidecar.get("status")
+    return {
+        "status": status if status in ("ok", "error") else "unknown",
+        "text": text(sidecar.get("text"), _TRANSCRIPT_TEXT_LIMIT) or "",
+        "model": text(sidecar.get("model"), 120),
+        "attempts": attempts if isinstance(attempts, int) else None,
+        "error": text(sidecar.get("error"), _TRANSCRIPT_ERROR_LIMIT),
+        "retryable": sidecar.get("retryable") is True,
+        "cost_usd": cost if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None,
+        "updated_at": text(sidecar.get("updated_at"), 40),
+    }
 
 
 def _json_response(payload: dict[str, object]) -> JSONResponse:
@@ -404,6 +451,17 @@ audio { width: 100%; margin-top: 0.25rem; }
   font-size: 0.9rem;
 }
 .warn { color: var(--danger); font-size: 0.9rem; }
+.transcript {
+  margin: 0.75rem 0 0.25rem;
+  font-size: 1.05rem;
+  overflow-wrap: anywhere;
+}
+.transcript-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+  overflow-wrap: anywhere;
+}
 .empty { color: var(--muted); text-align: center; padding: 2rem 0; }
 </style>
 </head>
@@ -467,6 +525,37 @@ audio { width: 100%; margin-top: 0.25rem; }
     var dd = document.createElement("dd");
     dd.textContent = value;
     container.append(dt, dd);
+  }
+
+  function formatCost(value) {
+    if (typeof value !== "number" || !isFinite(value)) return null;
+    if (value > 0 && value < 0.01) return "$" + value.toFixed(5);
+    return "$" + value.toFixed(2);
+  }
+
+  function transcriptNote(transcript) {
+    var parts = [];
+    if (transcript.model) parts.push(transcript.model);
+    if (typeof transcript.attempts === "number") {
+      parts.push(
+        transcript.attempts +
+          (transcript.attempts === 1 ? " attempt" : " attempts")
+      );
+    }
+    var cost = formatCost(transcript.cost_usd);
+    if (cost) parts.push(cost);
+    return parts.join(" · ");
+  }
+
+  // A recording is pending while its transcript has not settled. A recording
+  // with no sidecar only counts as pending while it is fresh, so a storage
+  // directory from before transcription was enabled does not poll forever.
+  function isPending(item) {
+    if (item.transcript) {
+      return item.transcript.status !== "ok" && item.transcript.retryable === true;
+    }
+    var received = Date.parse(item.received_at);
+    return isFinite(received) && Date.now() - received < 60000;
   }
 
   function audioUrl(id, download) {
@@ -537,6 +626,32 @@ audio { width: 100%; margin-top: 0.25rem; }
       download.textContent = "Download";
       card.append(download);
 
+      if (item.transcript) {
+        if (item.transcript.status === "ok") {
+          var transcript = document.createElement("p");
+          transcript.className = "transcript";
+          transcript.textContent =
+            item.transcript.text || "(no speech detected)";
+          card.append(transcript);
+          var note = document.createElement("p");
+          note.className = "transcript-note";
+          note.textContent = transcriptNote(item.transcript);
+          card.append(note);
+        } else {
+          var failed = document.createElement("p");
+          failed.className = "warn";
+          failed.textContent =
+            "Transcription failed: " +
+            (item.transcript.error || "unknown error");
+          card.append(failed);
+        }
+      } else {
+        var waiting = document.createElement("p");
+        waiting.className = "transcript-note";
+        waiting.textContent = "Transcribing…";
+        card.append(waiting);
+      }
+
       listEl.append(card);
     });
   }
@@ -561,6 +676,7 @@ audio { width: 100%; margin-top: 0.25rem; }
       }
       var items = Array.isArray(data.recordings) ? data.recordings : [];
       render(items);
+      schedulePoll(items);
       statusEl.textContent =
         items.length + (items.length === 1 ? " recording" : " recordings");
     } catch (error) {

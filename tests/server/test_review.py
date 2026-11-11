@@ -273,3 +273,125 @@ def test_unparseable_stored_file_is_listed_with_parse_error(
     assert item["duration_seconds"] is None
     assert item["size_bytes"] == len(body)
     assert client.get(f"/recordings/{recording_id}.wav").content == body
+
+
+# Transcripts ---------------------------------------------------------------
+
+
+def _write_sidecar(path: pathlib.Path, **fields: object) -> None:
+    import json
+
+    payload = {"status": "ok", "text": "", "attempts": 1}
+    payload.update(fields)
+    path.with_suffix(".transcript.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+
+
+def test_listing_reports_no_transcript_when_the_sidecar_is_missing(
+    client: TestClient, storage_dir: pathlib.Path
+) -> None:
+    _store(storage_dir, _wav())
+
+    item = client.get("/api/recordings").json()["recordings"][0]
+
+    assert item["transcript"] is None
+
+
+def test_listing_includes_a_successful_transcript(
+    client: TestClient, storage_dir: pathlib.Path
+) -> None:
+    _, path = _store(storage_dir, _wav())
+    _write_sidecar(
+        path,
+        text="Speak now. Fifteen, fourteen.",
+        model="mistralai/voxtral-small-24b-2507",
+        usage={"cost": 0.0015},
+        updated_at="2026-11-11T12:00:00+00:00",
+    )
+
+    transcript = client.get("/api/recordings").json()["recordings"][0]["transcript"]
+
+    assert transcript["status"] == "ok"
+    assert transcript["text"] == "Speak now. Fifteen, fourteen."
+    assert transcript["model"] == "mistralai/voxtral-small-24b-2507"
+    assert transcript["attempts"] == 1
+    assert transcript["cost_usd"] == 0.0015
+    assert transcript["retryable"] is False
+
+
+def test_listing_includes_a_failed_transcript(
+    client: TestClient, storage_dir: pathlib.Path
+) -> None:
+    _, path = _store(storage_dir, _wav())
+    _write_sidecar(
+        path,
+        status="error",
+        text="",
+        error="OpenRouter rate-limited the request.",
+        retryable=True,
+    )
+
+    transcript = client.get("/api/recordings").json()["recordings"][0]["transcript"]
+
+    assert transcript["status"] == "error"
+    assert transcript["retryable"] is True
+    assert "rate-limited" in transcript["error"]
+
+
+def test_a_malformed_sidecar_does_not_break_the_listing(
+    client: TestClient, storage_dir: pathlib.Path
+) -> None:
+    _, path = _store(storage_dir, _wav())
+    path.with_suffix(".transcript.json").write_text("{not json", encoding="utf-8")
+
+    response = client.get("/api/recordings")
+
+    assert response.status_code == 200
+    assert response.json()["recordings"][0]["transcript"] is None
+
+
+def test_transcript_fields_are_retyped_and_capped(
+    client: TestClient, storage_dir: pathlib.Path
+) -> None:
+    _, path = _store(storage_dir, _wav())
+    _write_sidecar(
+        path,
+        status="something-else",
+        text="x" * 9000,
+        attempts="three",
+        error="y" * 900,
+        cost_usd="free",
+        usage={"cost": "free"},
+    )
+
+    transcript = client.get("/api/recordings").json()["recordings"][0]["transcript"]
+
+    assert transcript["status"] == "unknown"
+    assert len(transcript["text"]) == 4000
+    assert transcript["attempts"] is None
+    assert len(transcript["error"]) == 500
+    assert transcript["cost_usd"] is None
+
+
+def test_deleting_a_recording_removes_its_sidecars(
+    client: TestClient, storage_dir: pathlib.Path
+) -> None:
+    recording_id, path = _store(storage_dir, _wav())
+    _write_sidecar(path, text="hello")
+
+    response = client.delete(f"/api/recordings/{recording_id}")
+
+    assert response.status_code == 200
+    assert not path.exists()
+    assert not path.with_suffix(".txt").exists()
+    assert not path.with_suffix(".transcript.json").exists()
+
+
+def test_the_page_renders_transcripts(client: TestClient) -> None:
+    page = client.get("/").text
+
+    assert "item.transcript" in page
+    assert "Transcribing" in page
+    assert "Transcription failed" in page
+    assert "schedulePoll" in page
