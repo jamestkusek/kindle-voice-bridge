@@ -297,6 +297,31 @@ The `tools\kvb.ps1` script is the single entry point for the host operations.
 - `test` runs `python -m pytest -q`.
 - `help` prints the usage text.
 
+The `receiver` command reads the token from `.data\receiver-config.json`. When
+that file is absent, it reads the token from the Kindle `upload.json`. When both
+files are absent, it writes a new token to `.data\receiver-config.json`. The
+script never prints the token.
+
+The command sets `KVB_TOKEN`, `KVB_STORAGE_DIR`, and `KVB_ALLOW_INSECURE_LAN`.
+It sets `OPENROUTER_API_KEY` from
+`server/voice_bridge_server/voxtral-openrouter-key.txt` when that file exists.
+
+To start the receiver without the script, run these commands in PowerShell from
+the project directory:
+
+```powershell
+python -m pip install -e .
+$env:KVB_TOKEN = python -c "import secrets; print(secrets.token_urlsafe(32))"
+$env:KVB_STORAGE_DIR = "$env:LOCALAPPDATA\KindleVoiceBridge\recordings"
+python -m uvicorn voice_bridge_server.app:create_app_from_env --factory --host 127.0.0.1 --port 18767
+```
+
+The manual command binds to the computer only. The Kindle cannot connect to that
+address. For a LAN test, bind the receiver to its LAN address, set
+`KVB_SERVER_URL` to that address, and set `KVB_ALLOW_INSECURE_LAN=1` on the
+client. Do not expose the receiver to the internet. Use verified HTTPS for a
+remote server.
+
 ## Limits and risks
 
 ### The Bluetooth handoff

@@ -53,50 +53,19 @@ python -m pip install -e .
 The receiver answers at `http://127.0.0.1:18767/healthz`. The review page is at
 `http://127.0.0.1:18767/`.
 
-The `receiver` command reads the token from `.data\receiver-config.json`. When
-that file is absent, the command reads the token from the Kindle `upload.json`.
-When both files are absent, the command writes a new token to
-`.data\receiver-config.json`. The script never prints the token.
-
-The command sets `KVB_TOKEN`, `KVB_STORAGE_DIR`, and `KVB_ALLOW_INSECURE_LAN`.
-It sets `OPENROUTER_API_KEY` from
-`server/voice_bridge_server/voxtral-openrouter-key.txt` when that file exists.
-Without the key file, transcription is off. The receiver stores accepted WAV
-files in `%LOCALAPPDATA%\KindleVoiceBridge\recordings`.
+The command creates a token when none exists and never prints it. It stores
+recordings in `%LOCALAPPDATA%\KindleVoiceBridge\recordings`. It turns
+transcription on when
+`server/voice_bridge_server/voxtral-openrouter-key.txt` exists.
 
 Add `-LocalOnly` to bind `127.0.0.1` only. The command prints the process ID.
-Stop the receiver with `Stop-Process -Id <pid>`. Run `.\tools\kvb.ps1 help`
-for the full option list.
+Stop the receiver with `Stop-Process -Id <pid>`.
 
-The PowerShell execution policy may block the script. In that case, run this
-command:
+If the execution policy blocks the script, run this command:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\kvb.ps1 receiver
 ```
-
-### Start without the script
-
-Run these commands in PowerShell from the project directory:
-
-```powershell
-python -m pip install -e .
-$env:KVB_TOKEN = python -c "import secrets; print(secrets.token_urlsafe(32))"
-$env:KVB_STORAGE_DIR = "$env:LOCALAPPDATA\KindleVoiceBridge\recordings"
-python -m uvicorn voice_bridge_server.app:create_app_from_env --factory --host 127.0.0.1 --port 18767
-```
-
-Open `http://127.0.0.1:18767/healthz` to check the receiver. Stop the receiver
-with Ctrl+C.
-
-The manual command binds to the computer only. The Kindle cannot connect to this
-address. A LAN test requires a trusted network. Bind the receiver to its LAN
-address. Set `KVB_SERVER_URL` to that address, and set
-`KVB_ALLOW_INSECURE_LAN=1` on the client. Do not expose this receiver directly
-to the internet. Use verified HTTPS for a remote server.
-
-Open the stored files with an audio player. Delete the files when they are no
-longer needed.
 
 ## 4. Connect the Kindle and copy the files
 
@@ -107,26 +76,20 @@ longer needed.
    .\tools\kvb.ps1 deploy -KindleRoot D:\ -ServerUrl http://<laptop-ip>:18767
    ```
 
-The `deploy` command copies the device files to
-`/mnt/us/kindle-voice-bridge/`. It copies the KOReader plugin to
-`/mnt/us/koreader/plugins/voicebridge.koplugin/`. It does not copy the Python
-runtime or the Bumble bundle.
+The command copies the device files and the KOReader plugin. It does not copy
+the Python runtime or the Bumble bundle.
 
 ## 5. Write the upload configuration
 
-The device reads `/mnt/us/kindle-voice-bridge/upload.json`. The file holds
-`server_url` and `token`.
-
-The `deploy` command writes the file when `-ServerUrl` is present. The command
-keeps an existing file. Add `-Force` to replace it.
+The device reads `/mnt/us/kindle-voice-bridge/upload.json`, which holds
+`server_url` and `token`. The `deploy` command writes the file when
+`-ServerUrl` is present. Add `-Force` to replace an existing file.
 
 To write the file by hand, create it with this content:
 
 ```json
 {"server_url": "http://<laptop-ip>:18767", "token": "<token>"}
 ```
-
-The device keeps the file, so later runs reuse it.
 
 ## 6. Make the first recording
 
