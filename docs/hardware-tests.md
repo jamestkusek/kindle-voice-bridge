@@ -40,14 +40,12 @@ These plugin actions work on the device:
 
 The resident Bluetooth session has been deployed. The operator reports one
 Bluetooth handoff at session start and multiple recordings without Bluetooth
-disconnects. The manual Ask question path has not been
-hardware-tested. Offline tests use fakes and do not touch the device.
+disconnects. The manual Ask question path has run on the device many times.
 
-That path now opens a strip along the bottom edge, driven by the daemon's state
-file. The
-page logic is covered by `tests/koreader/voicebridge_spec.lua`, which stubs the
-KOReader widgets and drives the page through preparing, recording, stopping,
-sent, failed, capped and stale states. The spec does not test how the page looks
+That path opens a strip along the bottom edge, driven by the daemon's state
+file. The page logic is covered by `tests/koreader/voicebridge_spec.lua`, which
+stubs the KOReader widgets and drives the page through preparing, recording,
+stopping, sent, failed, capped and stale states. The spec does not test how the page looks
 on e-ink: the partial refresh cost of a 1 Hz countdown, and whether the
 inverted page ghosts, are unmeasured on the device.
 
@@ -184,16 +182,14 @@ uploaded the file to the receiver. The receiver stored a 5.003 s mono 8 kHz
 
 The settle detector worked live. The leading DC/frozen-spectrum artifact is
 gone and the recording starts clean: mean -0.8, no DC offset, speech from
-0.21 s. The resident manual path deliberately skips that detector: it records
-from SCO readiness, for up to 15 seconds, and may include startup artifact or
-silence at the beginning. That manual path remains unverified on hardware.
+0.21 s. The resident manual path does not use that detector. It stores from the
+first packet and trims everything before the cue, so the file starts where the
+microphone became live.
 
-Its user interface is unverified too. The daemon publishes
-`/tmp/voicebridge-bt-session.state` every 100 ms, and the plugin repaints the
-page from that file. A hardware run should confirm three things: that **SPEAK
-NOW** appears within about a second of the microphone going live, that the
-countdown matches the real remaining time, and that the page does not ghost
-badly after 15 one-second partial refreshes.
+The interface has run on hardware. The strip appears on the bottom edge, the
+countdown matches the daemon's remaining time, and a tap stops the capture. A
+6.61 s recording from an early stop confirmed the command-file stop. A later run
+confirmed the answer popup.
 
 ### Cue timing
 

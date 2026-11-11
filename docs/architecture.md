@@ -111,10 +111,10 @@ not call `power_on` again, and does not restore Bluetooth between recordings.
 Bluetooth drops once at session start and once at session end.
 
 The operator reported that the single handoff and the repeated recordings work
-on the device. The manual path has produced recordings and uploads on the device. The first runs cued the operator too
-early, so the start of the speech was lost. The current detector has not been
-tested on hardware. The offline tests use fakes and do not touch Bluetooth
-hardware.
+on the device. The manual path has produced recordings and uploads on the
+device. The first runs cued the operator too early, so the start of the speech
+was lost. The current detector fixed that and has run on hardware. The offline
+tests use fakes and do not touch Bluetooth hardware.
 
 Start the session from the plugin, or from a device shell:
 
