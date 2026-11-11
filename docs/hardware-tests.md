@@ -25,6 +25,11 @@ with status 139, so the failure is not caused by the `/mnt/us` mount.
 A portable CPython 3.11.17 runs on the device. The `ssl`, `socket`, `ctypes`,
 and `asyncio` modules import successfully. TLS connections remain untested.
 
+Bumble 0.0.236 runs on that interpreter with the `bumble.crypto.builtin`
+backend. All required Bumble modules import on the device, and the AES-CMAC
+self-test passes there. The builtin backend is acceptable here because a stored
+link key means the controller performs authentication.
+
 ## KOReader plugin
 
 These plugin actions work on the device:
@@ -33,6 +38,7 @@ These plugin actions work on the device:
 - Inspect Bluetooth
 - Start HCI probe
 - Stop HCI probe
+- Record and send
 - Export Bluetooth link keys
 
 The upload path was verified separately: `kindle/voice_bridge/test_upload.py`
@@ -40,12 +46,10 @@ sent a generated WAV to the Windows receiver over Wi-Fi. The plugin no longer
 exposes that test as a menu action; the upload path is verified end to end but
 is not part of the HCI flow.
 
-The **Record and send** action and `kindle/voice_bridge/capture_local.py` are
-new and have not run on the device. They reuse the tested handoff and restore,
-Bumble on the Kindle controller, the settle detector and the upload path. They
-add three unproven things: Bumble's `serial:` transport on `/dev/ttymxc2`,
-Bumble and the Audio Gateway running on ARMv7, and the upload immediately after
-the Bluetooth restore.
+The **Record and send** action and `kindle/voice_bridge/capture_local.py` have
+now run the full chain on the device. Bumble's `serial:` transport on
+`/dev/ttymxc2`, Bumble and the Audio Gateway on ARMv7, and the upload after the
+Bluetooth restore all completed in one run.
 
 ## Network direction
 
@@ -106,11 +110,33 @@ In run 3 the operator confirmed by ear that the final ~2.38 s is their voice.
 All 1,328 packets were reported with status `correct`; no packet was reported as
 possibly invalid, missing data, or partially lost.
 
+## On-device capture
+
+The first fully on-device run succeeded end to end. The Kindle read the headset
+link key from `/var/local/zbluetooth/bt_devices.xml` in memory and never
+exported it, performed the handoff, ran Bumble over the real UART as an HFP
+Audio Gateway, captured the microphone, wrote a WAV, restored Bluetooth, and
+uploaded the file to the receiver. The receiver stored a 5.003 s mono 8 kHz
+16-bit WAV.
+
+The settle detector worked live. The leading DC/frozen-spectrum artifact is
+gone and the recording starts clean: mean -0.8, no DC offset, speech from
+0.21 s.
+
 ## Remaining known issues
 
-- The first ~2.4 s of a capture is a non-speech artifact, likely a stale or
-  unfed SCO receive buffer. Speech starts only after it. `tools/hfp_capture.py`
-  now discards it: a 0.40 s sliding window must show a small packet DC offset,
+- A 1.42 s stretch of literal digital silence runs from 2.97 s to 4.39 s. The
+  gap is 94.9% exact zeros with no noise floor, which points to the headset
+  gating its own microphone rather than packet loss.
+- Bandwidth is narrow: 99% of the energy sits below 1,474 Hz, so sibilants are
+  weak.
+- The settle took 6.61 s on the device versus 2.4 s on the laptop. A run takes
+  roughly 11 s of wall-clock for 5 s of audio.
+- Bluetooth still drops twice per run.
+- The earlier captures began with a non-speech artifact, likely a stale or
+  unfed SCO receive buffer. The on-device run did not show it.
+  `tools/hfp_capture.py` discards it: a 0.40 s sliding window must show a small
+  packet DC offset,
   a zero-crossing rate of at least 600/s, and an RMS of at least 60 counts
   before the capture starts recording. Replaying the three captures offline
   (`tools/replay_settle.py`) settles run 3 at 2.587 s after discarding 690

@@ -1,9 +1,10 @@
 # Kindle Voice Bridge
 
 This project records a Bluetooth headset microphone on a Kindle PW4 and sends
-short clips to a computer. The receiver, the Kindle upload path, and a Bluetooth
-HFP capture to the laptop have been verified on a real PW4. The remaining gaps
-are listed in [docs/hardware-tests.md](docs/hardware-tests.md).
+short clips to a computer. The receiver, the Kindle upload path, a laptop HFP
+capture, and a fully on-device capture and upload have been verified on a real
+PW4. The remaining gaps are listed in
+[docs/hardware-tests.md](docs/hardware-tests.md).
 
 This project was undertaken as part of the hiring process for the Hiya Software
 Engineering Intern position.
@@ -45,8 +46,9 @@ the internet. Use verified HTTPS for a remote server.
 
 ## Laptop HCI dependency
 
-The laptop tools need Bumble 0.0.236. Install the optional dependency from the
-project directory:
+The laptop tools need Bumble 0.0.236. Bumble also runs on the Kindle's bundled
+Python 3.11.17 with the `bumble.crypto.builtin` backend. Install the optional
+dependency from the project directory:
 
 ```powershell
 python -m pip install -e '.[hci]'
@@ -132,9 +134,18 @@ the Bluetooth handoff, runs the HFP Audio Gateway with Bumble on the device,
 writes a mono 8 kHz 16-bit PCM WAV in `/tmp`, restores Bluetooth, uploads the
 WAV, and deletes it.
 
-This path is **not yet tested on hardware**. The parts it uses are tested
-separately: the handoff and restore, Bumble on the Kindle controller, and the
-upload.
+This path is verified end to end on hardware. The first fully on-device run read
+the link key from `/var/local/zbluetooth/bt_devices.xml` in memory (never
+exported), performed the handoff, ran Bumble over the real UART, captured the
+microphone, wrote a 5.003 s mono 8 kHz 16-bit WAV, restored Bluetooth, and
+uploaded it. The receiver stored the file.
+
+The settle detector worked live: the recording starts clean with no leading DC
+artifact (mean -0.8, speech from 0.21 s). Known limits are a 1.42 s stretch of
+digital silence from 2.97 s to 4.39 s, narrow bandwidth (99% of energy below
+1,474 Hz), a 6.61 s device settle that makes a run about 11 s of wall-clock for
+5 s of audio, and the two Bluetooth drops per run. See
+[docs/hardware-tests.md](docs/hardware-tests.md).
 
 Deploy steps:
 
