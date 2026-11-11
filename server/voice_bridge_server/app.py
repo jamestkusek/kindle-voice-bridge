@@ -31,9 +31,11 @@ from fastapi.responses import JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import ClientDisconnect
 
+from .answer import DEFAULT_ANSWER_MODEL
+from .answers import answer_recording, read_answer
 from .audio import WavError, parse_wav
 from .config import Settings
-from .review import register_review_routes
+from .review import InvalidRecordingId, recording_path, register_review_routes
 from .storage import LocalFileStore, RecordingStore, new_recording_id
 from .transcribe import DEFAULT_MODEL as DEFAULT_TRANSCRIBE_MODEL
 from .transcripts import transcribe_recording
@@ -77,12 +79,17 @@ def create_app(
     *,
     store: RecordingStore | None = None,
     transcribe: Callable[[pathlib.Path], object] | None = None,
+    answer: Callable[[pathlib.Path, str], object] | None = None,
 ) -> FastAPI:
     """Build the ASGI application and validate the storage directory.
 
     ``transcribe`` is an optional callable that receives the stored path of each
     accepted recording. It runs as a background task after the response is sent,
     so the upload contract never depends on it. ``None`` disables transcription.
+
+    ``answer`` is an optional callable that receives ``(stored_path,
+    transcript_text)``. It runs in the same background task, after a successful
+    transcription with a non-empty transcript, and is never called otherwise.
     """
 
     _prepare_storage(settings.storage_dir)
@@ -100,6 +107,7 @@ def create_app(
 
     app.state.settings = settings
     app.state.transcribe = transcribe
+    app.state.answer = answer
     app.state.store = (
         store if store is not None else LocalFileStore(settings.storage_dir)
     )
@@ -112,8 +120,32 @@ def create_app(
         request: Request, background: BackgroundTasks
     ) -> Response:
         return await _handle_upload(
-            request, settings, app.state.store, background, transcribe
+            request, settings, app.state.store, background, transcribe, answer
         )
+
+    @app.get("/v1/recordings/{recording_id}/answer", include_in_schema=False)
+    async def get_answer(recording_id: str, request: Request) -> Response:
+        authorization_values = request.headers.getlist("authorization")
+        if len(authorization_values) != 1 or not _token_matches(
+            authorization_values[0], settings.token
+        ):
+            return _error_response(
+                401,
+                "unauthorized",
+                "Missing or invalid bearer token.",
+                extra_headers={
+                    "WWW-Authenticate": 'Bearer realm="voice-bridge"'
+                },
+            )
+
+        try:
+            path = recording_path(settings.storage_dir, recording_id)
+        except InvalidRecordingId:
+            return _error_response(404, "not_found", "Resource not found.")
+        if not path.is_file():
+            return _error_response(404, "not_found", "Resource not found.")
+
+        return _answer_response(recording_id, read_answer(path))
 
     @app.api_route(
         "/healthz",
@@ -187,7 +219,11 @@ def create_app_from_env(
         storage_dir=storage_dir,
         **settings_kwargs,
     )
-    return create_app(settings, transcribe=_transcriber_from_env(env))
+    return create_app(
+        settings,
+        transcribe=_transcriber_from_env(env),
+        answer=_answerer_from_env(env),
+    )
 
 
 def _transcriber_from_env(
@@ -211,12 +247,33 @@ def _transcriber_from_env(
     return transcribe
 
 
+def _answerer_from_env(
+    env: Mapping[str, str],
+) -> Callable[[pathlib.Path, str], object] | None:
+    """Return an answer callable, or ``None`` when it is not configured.
+
+    Answering shares ``OPENROUTER_API_KEY`` with transcription: without a key
+    neither outbound call happens. ``KVB_ANSWER_MODEL`` overrides the model.
+    """
+
+    api_key = env.get("OPENROUTER_API_KEY", "")
+    if not api_key.strip():
+        return None
+    model = env.get("KVB_ANSWER_MODEL", "").strip() or DEFAULT_ANSWER_MODEL
+
+    def answer(path: pathlib.Path, transcript: str) -> object:
+        return answer_recording(path, transcript, api_key, model=model)
+
+    return answer
+
+
 async def _handle_upload(
     request: Request,
     settings: Settings,
     store: RecordingStore,
     background: BackgroundTasks | None = None,
     transcribe: Callable[[pathlib.Path], object] | None = None,
+    answer: Callable[[pathlib.Path, str], object] | None = None,
 ) -> Response:
     # 2. Authentication runs before every body check.
     authorization_values = request.headers.getlist("authorization")
@@ -363,20 +420,74 @@ async def _handle_upload(
     # is sent, so it cannot change the status or the body. A failure is logged
     # by type only, never with audio or credentials.
     if transcribe is not None and background is not None:
-        background.add_task(_transcribe_quietly, transcribe, stored_path)
+        background.add_task(
+            _transcribe_quietly, transcribe, answer, stored_path
+        )
 
     return _json_response(payload, 201)
 
 
 def _transcribe_quietly(
-    transcribe: Callable[[pathlib.Path], object], path: pathlib.Path
+    transcribe: Callable[[pathlib.Path], object],
+    answer: Callable[[pathlib.Path, str], object] | None,
+    path: pathlib.Path,
 ) -> None:
-    """Run one transcription without letting it reach the upload path."""
+    """Run one transcription, then its answer, without reaching the upload path."""
 
     try:
-        transcribe(path)
+        result = transcribe(path)
     except Exception as exc:
         logger.warning("transcribe_error type=%s", type(exc).__name__)
+        return
+
+    if answer is None:
+        return
+    text = result.get("text") if isinstance(result, dict) else None
+    if not isinstance(text, str) or not text.strip():
+        return
+    _answer_quietly(answer, path, text)
+
+
+def _answer_quietly(
+    answer: Callable[[pathlib.Path, str], object],
+    path: pathlib.Path,
+    transcript: str,
+) -> None:
+    """Run one answer without letting it reach the upload path."""
+
+    try:
+        answer(path, transcript)
+    except Exception as exc:
+        logger.warning("answer_error type=%s", type(exc).__name__)
+
+
+def _answer_response(recording_id: str, sidecar: dict | None) -> JSONResponse:
+    """Shape one answer sidecar into the read contract."""
+
+    if sidecar is None:
+        return _json_response({"id": recording_id, "status": "pending"}, 200)
+    if sidecar.get("status") == "ok":
+        model = sidecar.get("model")
+        return _json_response(
+            {
+                "id": recording_id,
+                "status": "ready",
+                "text": sidecar.get("text") or "",
+                "model": model if isinstance(model, str) else "",
+            },
+            200,
+        )
+    error = sidecar.get("error")
+    return _json_response(
+        {
+            "id": recording_id,
+            "status": "failed",
+            "error": error
+            if isinstance(error, str) and error
+            else "The answer failed.",
+        },
+        200,
+    )
 
 
 def _token_matches(value: str, expected: str) -> bool:
