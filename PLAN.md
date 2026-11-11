@@ -1,5 +1,8 @@
 # Kindle Voice Bridge: Project Plan
 
+> Historical planning document. It describes the first milestone and the safety
+> gates. See [README.md](README.md) for the current state.
+
 ## Goal
 
 Record a short spoken prompt from a Bluetooth headset on the Kindle and send it over Wi-Fi to a receiver running on the Windows laptop. Design the receiver so it can later be moved to a remote server:

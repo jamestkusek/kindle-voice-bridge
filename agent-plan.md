@@ -1,5 +1,8 @@
 # Agent implementation plan
 
+> Historical coordinator brief for the first milestone. See [README.md](README.md)
+> for the current state.
+
 ## Coordinator brief
 
 Implement the first milestone defined in [`PLAN.md`](PLAN.md): capture a short Bluetooth-headset microphone recording **on the Kindle PW4** and send it over Wi-Fi to a receiver running on the Windows laptop. The initial control interface is a KOReader plugin, with capture independent of the reader. The laptop must be awake and running the receiver for this phase. Design the receiver and upload contract so the application can later be deployed remotely without requiring the laptop during normal use.
@@ -26,7 +29,6 @@ kindle-voice-bridge/
 ├── agent-plan.md                  # this handoff
 ├── README.md                      # setup and operation; initially blank
 ├── .gitignore, pyproject.toml     # initially blank
-├── config/                        # example settings, never real secrets
 ├── docs/                          # protocol, recovery, hardware evidence
 ├── kindle/voice_bridge/           # capture, lifecycle, control and uploader
 ├── koreader/voicebridge.koplugin/ # initial reader controls

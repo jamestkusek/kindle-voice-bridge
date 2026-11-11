@@ -5,8 +5,8 @@
 
 .DESCRIPTION
     One entry point for the operations that run on the computer:
-    start the receiver, start the transcription worker, copy the device
-    files to a mounted Kindle, and run the test suite.
+    start, stop and restart the receiver, start the transcription worker,
+    copy the device files to a mounted Kindle, and run the test suite.
 
     The script never prints the bearer token or the OpenRouter key.
     It reads the token from .data\receiver-config.json, or from the
@@ -18,6 +18,9 @@
 
 .EXAMPLE
     .\tools\kvb.ps1 receiver
+
+.EXAMPLE
+    .\tools\kvb.ps1 restart
 
 .EXAMPLE
     .\tools\kvb.ps1 deploy -KindleRoot D:\ -ServerUrl http://192.168.1.20:18767
@@ -60,6 +63,8 @@ Kindle Voice Bridge host helper.
 
 Usage:
   tools\kvb.ps1 receiver  [-Port N] [-LocalOnly] [-Python PATH]
+  tools\kvb.ps1 stop      [-Port N]
+  tools\kvb.ps1 restart   [-Port N] [-LocalOnly] [-Python PATH]
   tools\kvb.ps1 transcriber [-Python PATH]
   tools\kvb.ps1 deploy    [-KindleRoot D:\] [-ServerUrl URL] [-Force]
   tools\kvb.ps1 test      [-Python PATH]
@@ -67,6 +72,8 @@ Usage:
 
 Commands:
   receiver     Start the FastAPI receiver in the background.
+  stop         Stop the receiver on the configured port.
+  restart      Stop the receiver, then start it again.
   transcriber  Start the OpenRouter transcription worker in the background.
   deploy       Copy the device files to a mounted Kindle.
   test         Run the test suite with pytest.
@@ -219,6 +226,18 @@ function Test-PortListening {
     }
 }
 
+function Resolve-ReceiverPort {
+    $listenPort = $DefaultPort
+    $config = Get-ReceiverConfig
+    if ($null -ne $config -and $config.Port -gt 0) {
+        $listenPort = $config.Port
+    }
+    if ($Port -gt 0) {
+        $listenPort = $Port
+    }
+    return $listenPort
+}
+
 function Start-Receiver {
     $config = Get-ReceiverConfig
     if ($null -eq $config) {
@@ -289,6 +308,42 @@ function Start-Receiver {
         }
         exit 1
     }
+}
+
+function Stop-Receiver {
+    $listenPort = Resolve-ReceiverPort
+    $listeners = Test-PortListening $listenPort
+    if (-not $listeners) {
+        Write-Output "nothing is listening on port $listenPort"
+        return
+    }
+
+    $stopped = @()
+    $owners = $listeners | Select-Object -ExpandProperty OwningProcess -Unique
+    foreach ($ownerId in $owners) {
+        $process = Get-CimInstance Win32_Process -Filter "ProcessId=$ownerId" -ErrorAction SilentlyContinue
+        if ($null -eq $process -or $process.CommandLine -notmatch 'voice_bridge_server\.app:create_app_from_env') {
+            Write-WarningLine "port $listenPort is held by pid $ownerId, which is not the receiver; not stopping it"
+            continue
+        }
+        Stop-Process -Id $ownerId -Force -ErrorAction SilentlyContinue
+        $stopped += $ownerId
+    }
+
+    if ($stopped.Count -eq 0) {
+        return
+    }
+
+    $deadline = (Get-Date).AddSeconds(5)
+    while ((Test-PortListening $listenPort) -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 200
+    }
+    Write-Output ("stopped pid " + ($stopped -join ',') + " on port $listenPort")
+}
+
+function Restart-Receiver {
+    Stop-Receiver
+    Start-Receiver
 }
 
 function Start-Transcriber {
@@ -405,6 +460,8 @@ if ($Help) {
 
 switch ($Command.ToLowerInvariant()) {
     'receiver' { Start-Receiver }
+    'stop' { Stop-Receiver }
+    'restart' { Restart-Receiver }
     'transcriber' { Start-Transcriber }
     'deploy' { Invoke-Deploy }
     'test' { Invoke-Tests }

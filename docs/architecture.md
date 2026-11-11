@@ -230,8 +230,10 @@ to 15 seconds by default. It validates each WAV with
 `voice_bridge_server.audio.parse_wav` and stores the file in `KVB_STORAGE_DIR`.
 The upload contract is in [protocol.md](protocol.md).
 
-The review page is at `http://127.0.0.1:18767/`. The page lists recordings,
-plays them, shows the transcript, and deletes a recording. The page is
+The dashboard is at `http://127.0.0.1:18767/`. The page lists recordings,
+shows the transcript and the answer, plays each clip, collapses the file
+metadata into a details disclosure, and deletes a recording. It refreshes live
+while new recordings and LLM responses arrive. The page is
 unauthenticated and is for the trusted LAN during development. Do not expose the
 page to the public internet. The detail is in [review-ui.md](review-ui.md).
 

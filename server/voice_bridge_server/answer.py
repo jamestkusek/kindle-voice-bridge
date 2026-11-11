@@ -27,16 +27,13 @@ from .transcribe import ENDPOINT, PermanentError, TransientError, Transport
 
 #: Cheap and fast. The answer is a couple of sentences, so a large model buys
 #: nothing here.
-DEFAULT_ANSWER_MODEL = "mistralai/mistral-small-24b-instruct-2501"
+DEFAULT_ANSWER_MODEL = "mistralai/mistral-small-2603"
 
 #: The transcript comes from an 8 kHz headset mic, so it may be a question, a
-#: fragment, or noise. The prompt keeps the reply short either way and forbids
-#: the preamble chat models add by default.
+#: fragment, or noise. The prompt asks for a clear, concise reply.
 ANSWER_PROMPT = (
-    "Answer the question in the user message directly, in two sentences or "
-    "fewer. If the message is not a question, reply with one short sentence. "
-    "Output only the answer: no preamble, no restating the question, no "
-    "commentary."
+    "You are an assistant running on a e-reader. Answer the following question in a clear and concise manne, like a response from a human, it should not go into too much detail. Use a "
+    "maximum of 80 words, and favour shorter answers where possible. Do not include any formatting, such as markdown, numbered lists or bullet-point. You can use new lines / line spacing to separate parts of your response for clarity."
 )
 
 

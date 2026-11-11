@@ -1,4 +1,4 @@
-# Kindle Voice Interface
+# Kindle Voice Bridge
 
 **Ask your book a question out loud, without leaving the page.**
 
@@ -24,14 +24,14 @@ explanations while reading. More broadly, anyone using KOReader's LLM features
 who would rather talk than type, and readers for whom a slow on-screen keyboard
 is a real barrier rather than an annoyance.
 
-## What I built (MVP)
+## What I built
 
-A feasibility prototype that proves the hard part: getting intelligible
-microphone audio off a Kindle Paperwhite 10th edition and onto a computer.
+A working prototype of the full loop: speak a question into a Bluetooth headset
+and read the LLM's answer on the Kindle.
 
-- **KOReader plugin (Lua)** — a Voice Bridge menu on the device: run diagnostics,
-  inspect Bluetooth, check the bundled Python/Bumble runtime, start and stop the
-  HCI probe, and export Bluetooth link keys.
+- **KOReader plugin (Lua)** — starts and stops the Bluetooth session, opens the
+  live recording strip, shows the answer in a popup, and exposes the same action
+  to KOReader gestures through the Dispatcher.
 - **Kindle-side capture supervisor (Python 3.11)** — stops the stock Bluetooth
   daemon, takes the Broadcom UART (`/dev/ttymxc2`) from `bsa_server`, switches it
   to raw H:4, and relays it to the laptop over an outbound TCP connection (the
@@ -40,34 +40,36 @@ microphone audio off a Kindle Paperwhite 10th edition and onto a computer.
 - **Laptop-side HFP Audio Gateway (Bumble)** — pairs with the headset using the
   exported link keys, negotiates HFP, opens the SCO voice link, and captures the
   mic stream. It detects and discards about 2.4 s of stale SCO buffer at the
-  start, then records five seconds of usable audio.
+  start, then records the clip.
+- **Receiver and upload path (FastAPI)** — an authenticated
+  `POST /v1/recordings` endpoint with strict WAV validation, size and duration
+  caps, atomic storage, and a Kindle-side uploader. The receiver transcribes the
+  clip with OpenRouter, asks a cheap LLM for a short answer, and writes both
+  sidecars next to the WAV.
+- **Local dashboard** — lists recordings, transcripts and answers, plays each
+  clip, collapses the file metadata into a details disclosure, and refreshes
+  live as new recordings and LLM responses arrive.
 - **Audio tooling** — raw HCI payload to WAV conversion, DC-offset removal and
   peak normalisation, plus an offline replay tool for tuning the "is this live
   audio?" detector.
-- **Receiver and upload path (FastAPI)** — an authenticated
-  `POST /v1/recordings` endpoint with strict WAV validation, size and duration
-  caps, atomic storage, and a Kindle-side uploader. The upload path was verified
-  end to end over Wi-Fi.
 
 ## What's proven, and what isn't
 
 Proven on real hardware: Bluetooth handoff and restoration, Bumble driving the
-Kindle controller over the relay, an HFP Audio Gateway reaching SCO, and an
-intelligible voice capture (confirmed by ear). The receiver and the Kindle
-upload path are tested independently.
+Kindle controller over the relay, an HFP Audio Gateway reaching SCO, intelligible
+voice capture, and the full loop in one session — capture, Wi-Fi upload,
+transcription, LLM answer, and the answer shown in KOReader.
 
-Not yet proven: the full chain in one session (capture → upload → transcription
-→ LLM → answer on the Kindle), Wi-Fi/Bluetooth coexistence during capture, and
-the actual audio format (PCM16 mono 8 kHz is a strong inference, not
-controller-confirmed). The laptop is still in the loop, the relay is plaintext
-and unauthenticated, and only one headset and one firmware version have been
-tested.
+Still open: the audio format is a strong inference (PCM16 mono 8 kHz), not
+controller-confirmed; Wi-Fi/Bluetooth coexistence during capture is not measured;
+the laptop is still in the loop; the relay is plaintext and unauthenticated; and
+only one headset and one firmware version have been tested. The question is sent
+without the current page or chapter as context.
 
 ## What I'd do next
 
-1. **Close the loop.** Add speech-to-text and an LLM call, pass the current
-   passage as context, and render the answer back in KOReader. That turns the
-   prototype into the thing I actually wanted.
+1. **Add reading context.** Send the current page, chapter and book title with
+   the question, so answers can use the passage the reader is looking at.
 2. **Remove the laptop.** Move the receiver to a hosted HTTPS service, or push
    capture and ASR onto the device, so normal use doesn't need a PC awake.
 3. **Make it a tap, not an experiment.** A single start/stop control in the
@@ -82,6 +84,5 @@ tested.
 
 ## Status
 
-Working title. MVP stage — the core concept (Kindle + Bluetooth headset →
-intelligible mic audio off-device) is validated; the user-facing product is not
-built yet.
+Working prototype. The full loop works on real hardware, but it still needs a
+laptop, a trusted LAN, and a manual session start.

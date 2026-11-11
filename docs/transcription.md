@@ -85,8 +85,8 @@ After the transcript, the receiver asks a second model for a short answer to the
 question. The default is `mistralai/mistral-small-24b-instruct-2501`. Override it
 with `KVB_ANSWER_MODEL`.
 
-The answer is two sentences, so a large model buys nothing. Measured on the
-question "what is a thunderhead?":
+The answer is short, so a large model buys nothing. Measured on the question
+"what is a thunderhead?":
 
 | Model | Prompt / completion per million | Answer | Cost |
 | --- | --- | --- | --- |
@@ -152,4 +152,6 @@ Options: `--model`, `--max-attempts` (default 3), `--timeout` (default 90 s),
   next to the recording.
 - The audio is sent to a third party. That is a deliberate choice for this
   prototype; the receiver itself stays local.
-- The review page does not show transcripts yet. They are files on disk.
+- The dashboard shows the transcript and the answer for each recording. The
+  file statistics and the per-stage sidecar fields are collapsed into a
+  **Details** disclosure on each card.

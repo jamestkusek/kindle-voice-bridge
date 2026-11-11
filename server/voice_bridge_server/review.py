@@ -16,7 +16,8 @@ Safety rules enforced here:
 * metadata is derived with :func:`voice_bridge_server.audio.parse_wav`, so there
   is no second WAV parser to keep in sync;
 * the page renders every value with DOM text nodes, never with ``innerHTML``;
-* the page polls only while a transcript is still pending, and stops on its own.
+* the page polls only while a transcript or answer is still pending, and stops
+  on its own.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from fastapi.responses import (
     Response,
 )
 
+from .answers import answer_path, read_answer
 from .audio import WavError, parse_wav
 from .config import Settings
 from .storage import RECORDING_ID_PATTERN
@@ -43,6 +45,7 @@ _SHA_PREFIX_CHARS = 12
 #: echo so a corrupt or hand-edited file cannot bloat the listing.
 _TRANSCRIPT_TEXT_LIMIT = 4000
 _TRANSCRIPT_ERROR_LIMIT = 500
+_ANSWER_TEXT_LIMIT = 4000
 #: A stored clip was validated against the upload limit when it arrived. The
 #: review listing only reports statistics, so it parses with a generous finite
 #: limit instead of the current setting. A recording that is longer than the
@@ -134,8 +137,8 @@ def delete_recording(
 ) -> None:
     """Delete one stored recording and its sidecars, or raise a specific error.
 
-    The transcript sidecars belong to the recording, so leaving them behind
-    would accumulate orphaned files in the storage directory.
+    The transcript and answer sidecars belong to the recording, so leaving them
+    behind would accumulate orphaned files in the storage directory.
     """
 
     path = recording_path(storage_dir, recording_id)
@@ -146,7 +149,7 @@ def delete_recording(
     except OSError as exc:
         raise RecordingDeleteFailed(recording_id) from exc
 
-    for sidecar in transcript_paths(path):
+    for sidecar in (*transcript_paths(path), answer_path(path)):
         try:
             sidecar.unlink()
         except OSError:
@@ -275,6 +278,7 @@ def _describe_recording(
         "bits_per_sample": None,
         "parse_error": None,
         "transcript": _transcript_summary(path),
+        "answer": _answer_summary(path),
     }
 
     try:
@@ -326,6 +330,38 @@ def _transcript_summary(path: pathlib.Path) -> dict[str, object] | None:
     }
 
 
+def _answer_summary(path: pathlib.Path) -> dict[str, object] | None:
+    """Return the answer sidecar for one recording, or ``None``.
+
+    The sidecar is written by the receiver, but every field is re-typed and
+    capped here so the page never renders an unexpected shape.
+    """
+
+    sidecar = read_answer(path)
+    if sidecar is None:
+        return None
+
+    def text(value: object, limit: int) -> str | None:
+        if not isinstance(value, str):
+            return None
+        return value if len(value) <= limit else value[: limit - 1] + "…"
+
+    usage = sidecar.get("usage")
+    cost = usage.get("cost") if isinstance(usage, dict) else None
+    status = sidecar.get("status")
+    return {
+        "status": status if status in ("ok", "error", "skipped") else "unknown",
+        "text": text(sidecar.get("text"), _ANSWER_TEXT_LIMIT) or "",
+        "model": text(sidecar.get("model"), 120),
+        "error": text(sidecar.get("error"), _TRANSCRIPT_ERROR_LIMIT),
+        "retryable": sidecar.get("retryable") is True,
+        "cost_usd": cost
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool)
+        else None,
+        "updated_at": text(sidecar.get("updated_at"), 40),
+    }
+
+
 def _json_response(payload: dict[str, object]) -> JSONResponse:
     return JSONResponse(
         payload, headers={"Cache-Control": "no-store"}
@@ -347,7 +383,7 @@ _REVIEW_PAGE_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Kindle Voice Bridge - Recordings</title>
+<title>Kindle Voice LLM Interface</title>
 <style>
 :root {
   color-scheme: light dark;
@@ -434,16 +470,24 @@ main { max-width: 960px; margin: 0 auto; display: grid; gap: 1rem; }
   margin: 0;
   overflow-wrap: anywhere;
 }
-.meta {
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  gap: 0.15rem 0.75rem;
-  margin: 0.75rem 0;
-  font-size: 0.9rem;
+.received { margin: 0.15rem 0 0; color: var(--muted); font-size: 0.8rem; }
+.section { margin-top: 0.85rem; }
+.section h3 {
+  margin: 0 0 0.2rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
 }
-.meta dt { color: var(--muted); }
-.meta dd { margin: 0; overflow-wrap: anywhere; }
-audio { width: 100%; margin-top: 0.25rem; }
+.answer { margin: 0; font-size: 1.15rem; overflow-wrap: anywhere; }
+.transcript { margin: 0; font-size: 1rem; overflow-wrap: anywhere; }
+.note {
+  margin: 0.2rem 0 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+  overflow-wrap: anywhere;
+}
+audio { width: 100%; margin-top: 0.9rem; }
 .download {
   display: inline-block;
   margin-top: 0.5rem;
@@ -451,32 +495,39 @@ audio { width: 100%; margin-top: 0.25rem; }
   font-size: 0.9rem;
 }
 .warn { color: var(--danger); font-size: 0.9rem; }
-.transcript {
-  margin: 0.75rem 0 0.25rem;
-  font-size: 1.05rem;
-  overflow-wrap: anywhere;
+details {
+  margin-top: 0.85rem;
+  border-top: 1px solid var(--border);
+  padding-top: 0.6rem;
 }
-.transcript-note {
-  margin: 0;
+summary { cursor: pointer; color: var(--muted); font-size: 0.85rem; }
+summary:hover { color: var(--accent); }
+.meta {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.15rem 0.75rem;
+  margin: 0.6rem 0 0;
+  font-size: 0.85rem;
+}
+.meta dt { color: var(--muted); }
+.meta dd { margin: 0; overflow-wrap: anywhere; }
+.detail-group { margin-top: 0.75rem; }
+.detail-group h4 {
+  margin: 0 0 0.2rem;
   color: var(--muted);
   font-size: 0.8rem;
-  overflow-wrap: anywhere;
 }
 .empty { color: var(--muted); text-align: center; padding: 2rem 0; }
 </style>
 </head>
 <body>
 <header>
-  <h1>Recordings</h1>
+  <h1>Kindle Voice LLM Interface</h1>
   <div class="actions">
     <span id="status" role="status" aria-live="polite"></span>
     <button id="refresh" type="button">Refresh<kbd>R</kbd></button>
   </div>
 </header>
-<p class="hint">
-  Local development review page. It is not authenticated, so use it only on a
-  trusted LAN. Recordings are read from the configured storage directory.
-</p>
 <main id="list" aria-live="polite"></main>
 <noscript>
   <p class="hint">This page needs JavaScript to list and play recordings.</p>
@@ -488,6 +539,8 @@ audio { width: 100%; margin-top: 0.25rem; }
   var listEl = document.getElementById("list");
   var statusEl = document.getElementById("status");
   var refreshBtn = document.getElementById("refresh");
+  var pollTimer = null;
+  var cards = new Map();
 
   function formatBytes(value) {
     if (typeof value !== "number" || !isFinite(value)) return "\\u2014";
@@ -533,29 +586,124 @@ audio { width: 100%; margin-top: 0.25rem; }
     return "$" + value.toFixed(2);
   }
 
-  function transcriptNote(transcript) {
+  function metadataNote(record) {
     var parts = [];
-    if (transcript.model) parts.push(transcript.model);
-    if (typeof transcript.attempts === "number") {
+    if (record.model) parts.push(record.model);
+    if (typeof record.attempts === "number") {
       parts.push(
-        transcript.attempts +
-          (transcript.attempts === 1 ? " attempt" : " attempts")
+        record.attempts +
+          (record.attempts === 1 ? " attempt" : " attempts")
       );
     }
-    var cost = formatCost(transcript.cost_usd);
+    var cost = formatCost(record.cost_usd);
     if (cost) parts.push(cost);
     return parts.join(" · ");
   }
 
-  // A recording is pending while its transcript has not settled. A recording
-  // with no sidecar only counts as pending while it is fresh, so a storage
-  // directory from before transcription was enabled does not poll forever.
-  function isPending(item) {
+  function answerNote(answer) {
+    var parts = [];
+    if (answer.model) parts.push(answer.model);
+    var cost = formatCost(answer.cost_usd);
+    if (cost) parts.push(cost);
+    return parts.join(" · ");
+  }
+
+  function isFresh(value, windowMs) {
+    var parsed = Date.parse(value);
+    var limit = typeof windowMs === "number" ? windowMs : 60000;
+    return isFinite(parsed) && Date.now() - parsed < limit;
+  }
+
+  // A transcript is pending until its sidecar settles. A recording with no
+  // sidecar only counts as pending while it is fresh, so a storage directory
+  // from before transcription was enabled does not poll forever.
+  function isTranscriptPending(item) {
     if (item.transcript) {
-      return item.transcript.status !== "ok" && item.transcript.retryable === true;
+      return item.transcript.status !== "ok" &&
+        item.transcript.retryable === true;
     }
-    var received = Date.parse(item.received_at);
-    return isFinite(received) && Date.now() - received < 60000;
+    return isFresh(item.received_at);
+  }
+
+  // The answer is written just after a successful transcript, so a fresh
+  // transcript with speech and no answer sidecar is still in flight.
+  function isAnswerPending(item) {
+    if (!item.transcript || item.transcript.status !== "ok") return false;
+    if (!item.transcript.text) return false;
+    if (item.answer) return false;
+    // The answer call has a 60-second timeout, so allow for that plus overhead.
+    return isFresh(item.transcript.updated_at, 120000);
+  }
+
+  function addSection(card, title, className, text, note) {
+    var section = document.createElement("section");
+    section.className = "section";
+    var heading = document.createElement("h3");
+    heading.textContent = title;
+    section.append(heading);
+    var body = document.createElement("p");
+    body.className = className;
+    body.textContent = text;
+    section.append(body);
+    if (note) {
+      var noteEl = document.createElement("p");
+      noteEl.className = "note";
+      noteEl.textContent = note;
+      section.append(noteEl);
+    }
+    card.append(section);
+  }
+
+  function addDetailGroup(container, title, record) {
+    if (!record) return;
+    var group = document.createElement("div");
+    group.className = "detail-group";
+    var heading = document.createElement("h4");
+    heading.textContent = title;
+    group.append(heading);
+    var meta = document.createElement("dl");
+    meta.className = "meta";
+    addMeta(meta, "Status", record.status);
+    if (record.model) addMeta(meta, "Model", record.model);
+    if (typeof record.attempts === "number") {
+      addMeta(meta, "Attempts", String(record.attempts));
+    }
+    var cost = formatCost(record.cost_usd);
+    if (cost) addMeta(meta, "Cost", cost);
+    if (record.updated_at) {
+      addMeta(meta, "Updated", formatTime(record.updated_at));
+    }
+    if (record.error) addMeta(meta, "Error", record.error);
+    group.append(meta);
+    container.append(group);
+  }
+
+  function buildDetails(item) {
+    var details = document.createElement("details");
+    var summary = document.createElement("summary");
+    summary.textContent = "Details";
+    details.append(summary);
+    fillDetails(details, item);
+    return details;
+  }
+
+  function fillDetails(details, item) {
+    while (details.lastChild !== details.firstChild) {
+      details.removeChild(details.lastChild);
+    }
+    var meta = document.createElement("dl");
+    meta.className = "meta";
+    addMeta(meta, "Received", formatTime(item.received_at));
+    addMeta(meta, "Duration", formatDuration(item.duration_seconds));
+    addMeta(meta, "Sample rate", formatNumber(item.sample_rate_hz, " Hz"));
+    addMeta(meta, "Channels", formatNumber(item.channels, ""));
+    addMeta(meta, "Bit depth", formatNumber(item.bits_per_sample, "-bit"));
+    addMeta(meta, "Size", formatBytes(item.size_bytes));
+    addMeta(meta, "SHA-256", item.sha256_prefix || "\u2014");
+    details.append(meta);
+
+    addDetailGroup(details, "Transcription", item.transcript);
+    addDetailGroup(details, "Answer", item.answer);
   }
 
   function audioUrl(id, download) {
@@ -563,97 +711,168 @@ audio { width: 100%; margin-top: 0.25rem; }
     return download ? url + "?download=1" : url;
   }
 
-  function render(items) {
-    listEl.replaceChildren();
-    if (!items.length) {
-      var empty = document.createElement("p");
-      empty.className = "empty";
-      empty.textContent = "No recordings yet.";
-      listEl.append(empty);
-      return;
+  function fillSections(container, item) {
+    container.replaceChildren();
+    if (item.parse_error) {
+      var warn = document.createElement("p");
+      warn.className = "warn";
+      warn.textContent =
+        "This file could not be parsed: " + item.parse_error;
+      container.append(warn);
     }
 
-    items.forEach(function (item) {
-      var card = document.createElement("article");
-      card.className = "recording";
-
-      var head = document.createElement("div");
-      head.className = "recording-head";
-
-      var title = document.createElement("h2");
-      title.textContent = item.id;
-      head.append(title);
-
-      var remove = document.createElement("button");
-      remove.type = "button";
-      remove.className = "danger";
-      remove.textContent = "Delete";
-      remove.addEventListener("click", function () {
-        deleteRecording(item.id);
-      });
-      head.append(remove);
-
-      card.append(head);
-
-      var meta = document.createElement("dl");
-      meta.className = "meta";
-      addMeta(meta, "Received", formatTime(item.received_at));
-      addMeta(meta, "Duration", formatDuration(item.duration_seconds));
-      addMeta(meta, "Sample rate", formatNumber(item.sample_rate_hz, " Hz"));
-      addMeta(meta, "Channels", formatNumber(item.channels, ""));
-      addMeta(meta, "Bit depth", formatNumber(item.bits_per_sample, "-bit"));
-      addMeta(meta, "Size", formatBytes(item.size_bytes));
-      addMeta(meta, "SHA-256", item.sha256_prefix || "\\u2014");
-      card.append(meta);
-
-      if (item.parse_error) {
-        var warn = document.createElement("p");
-        warn.className = "warn";
-        warn.textContent =
-          "This file could not be parsed: " + item.parse_error;
-        card.append(warn);
-      }
-
-      var audio = document.createElement("audio");
-      audio.controls = true;
-      audio.preload = "none";
-      audio.src = audioUrl(item.id, false);
-      card.append(audio);
-
-      var download = document.createElement("a");
-      download.className = "download";
-      download.href = audioUrl(item.id, true);
-      download.textContent = "Download";
-      card.append(download);
-
-      if (item.transcript) {
-        if (item.transcript.status === "ok") {
-          var transcript = document.createElement("p");
-          transcript.className = "transcript";
-          transcript.textContent =
-            item.transcript.text || "(no speech detected)";
-          card.append(transcript);
-          var note = document.createElement("p");
-          note.className = "transcript-note";
-          note.textContent = transcriptNote(item.transcript);
-          card.append(note);
-        } else {
-          var failed = document.createElement("p");
-          failed.className = "warn";
-          failed.textContent =
-            "Transcription failed: " +
-            (item.transcript.error || "unknown error");
-          card.append(failed);
-        }
+    if (item.answer) {
+      if (item.answer.status === "ok") {
+        addSection(
+          container,
+          "Answer",
+          "answer",
+          item.answer.text || "(no answer text)",
+          answerNote(item.answer)
+        );
+      } else if (item.answer.status === "skipped") {
+        addSection(
+          container,
+          "Answer",
+          "note",
+          "No answer: the transcript was empty."
+        );
       } else {
-        var waiting = document.createElement("p");
-        waiting.className = "transcript-note";
-        waiting.textContent = "Transcribing…";
-        card.append(waiting);
+        addSection(
+          container,
+          "Answer",
+          "warn",
+          "Answer failed: " +
+            (item.answer.error || "unknown error")
+        );
       }
+    } else if (isAnswerPending(item)) {
+      addSection(container, "Answer", "note", "Waiting for answer…");
+    }
 
-      listEl.append(card);
+    if (item.transcript) {
+      if (item.transcript.status === "ok") {
+        addSection(
+          container,
+          "Transcript",
+          "transcript",
+          item.transcript.text || "(no speech detected)",
+          metadataNote(item.transcript)
+        );
+      } else {
+        addSection(
+          container,
+          "Transcript",
+          "warn",
+          "Transcription failed: " +
+            (item.transcript.error || "unknown error")
+        );
+      }
+    } else if (isTranscriptPending(item)) {
+      addSection(container, "Transcript", "note", "Transcribing…");
+    } else {
+      addSection(container, "Transcript", "note", "No transcript.");
+    }
+  }
+
+  function createCard(item) {
+    var card = document.createElement("article");
+    card.className = "recording";
+
+    var head = document.createElement("div");
+    head.className = "recording-head";
+
+    var identity = document.createElement("div");
+    var title = document.createElement("h2");
+    title.textContent = item.id;
+    identity.append(title);
+    var received = document.createElement("p");
+    received.className = "received";
+    received.textContent = "Received " + formatTime(item.received_at);
+    identity.append(received);
+    head.append(identity);
+
+    var remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "danger";
+    remove.textContent = "Delete";
+    remove.addEventListener("click", function () {
+      deleteRecording(item.id);
     });
+    head.append(remove);
+    card.append(head);
+
+    var sections = document.createElement("div");
+    sections.className = "sections";
+    fillSections(sections, item);
+    card.append(sections);
+
+    var audio = document.createElement("audio");
+    audio.controls = true;
+    audio.preload = "none";
+    audio.src = audioUrl(item.id, false);
+    card.append(audio);
+
+    var download = document.createElement("a");
+    download.className = "download";
+    download.href = audioUrl(item.id, true);
+    download.textContent = "Download";
+    card.append(download);
+
+    var details = buildDetails(item);
+    card.append(details);
+
+    return {
+      card: card,
+      received: received,
+      sections: sections,
+      details: details,
+      signature: JSON.stringify(item),
+    };
+  }
+
+  function updateCard(entry, item) {
+    entry.received.textContent = "Received " + formatTime(item.received_at);
+    fillSections(entry.sections, item);
+    fillDetails(entry.details, item);
+    entry.signature = JSON.stringify(item);
+  }
+
+  function render(items) {
+    var empty = listEl.querySelector(".empty");
+    if (empty) empty.remove();
+
+    var seen = new Set();
+    items.forEach(function (item, index) {
+      seen.add(item.id);
+      var entry = cards.get(item.id);
+      var signature = JSON.stringify(item);
+      if (!entry) {
+        entry = createCard(item);
+        cards.set(item.id, entry);
+      } else if (entry.signature !== signature) {
+        updateCard(entry, item);
+      }
+      if (listEl.children[index] !== entry.card) {
+        listEl.insertBefore(entry.card, listEl.children[index] || null);
+      }
+    });
+
+    var stale = [];
+    cards.forEach(function (entry, id) {
+      if (!seen.has(id)) stale.push(id);
+    });
+    stale.forEach(function (id) {
+      cards.get(id).card.remove();
+      cards.delete(id);
+    });
+
+    if (!items.length) {
+      var message = document.createElement("p");
+      message.className = "empty";
+      message.textContent = "No recordings yet.";
+      listEl.append(message);
+    }
   }
 
   function describeError(data, fallback) {
@@ -663,9 +882,21 @@ audio { width: 100%; margin-top: 0.25rem; }
     return fallback;
   }
 
-  async function load() {
-    statusEl.textContent = "Loading\\u2026";
-    refreshBtn.disabled = true;
+  function schedulePoll(delayMs) {
+    if (pollTimer !== null) {
+      window.clearTimeout(pollTimer);
+    }
+    pollTimer = window.setTimeout(function () {
+      pollTimer = null;
+      load(true);
+    }, delayMs || 2000);
+  }
+
+  async function load(silent) {
+    if (!silent) {
+      statusEl.textContent = "Loading\\u2026";
+      refreshBtn.disabled = true;
+    }
     try {
       var response = await fetch("/api/recordings", { cache: "no-store" });
       var data = await response.json().catch(function () { return null; });
@@ -676,13 +907,14 @@ audio { width: 100%; margin-top: 0.25rem; }
       }
       var items = Array.isArray(data.recordings) ? data.recordings : [];
       render(items);
-      schedulePoll(items);
+      schedulePoll(2000);
       statusEl.textContent =
         items.length + (items.length === 1 ? " recording" : " recordings");
     } catch (error) {
       statusEl.textContent = String(error.message || error);
+      schedulePoll(5000);
     } finally {
-      refreshBtn.disabled = false;
+      if (!silent) refreshBtn.disabled = false;
     }
   }
 
@@ -704,13 +936,16 @@ audio { width: 100%; margin-top: 0.25rem; }
       }
       var items = Array.isArray(data.recordings) ? data.recordings : [];
       render(items);
+      schedulePoll(2000);
       statusEl.textContent = "Deleted.";
     } catch (error) {
       statusEl.textContent = String(error.message || error);
     }
   }
 
-  refreshBtn.addEventListener("click", load);
+  refreshBtn.addEventListener("click", function () {
+    load();
+  });
 
   document.addEventListener("keydown", function (event) {
     if (event.defaultPrevented || event.ctrlKey || event.metaKey ||

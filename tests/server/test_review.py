@@ -288,6 +288,16 @@ def _write_sidecar(path: pathlib.Path, **fields: object) -> None:
     )
 
 
+def _write_answer_sidecar(path: pathlib.Path, **fields: object) -> None:
+    import json
+
+    payload = {"status": "ok", "text": "", "model": "test/model"}
+    payload.update(fields)
+    path.with_suffix(".answer.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+
+
 def test_listing_reports_no_transcript_when_the_sidecar_is_missing(
     client: TestClient, storage_dir: pathlib.Path
 ) -> None:
@@ -296,6 +306,7 @@ def test_listing_reports_no_transcript_when_the_sidecar_is_missing(
     item = client.get("/api/recordings").json()["recordings"][0]
 
     assert item["transcript"] is None
+    assert item["answer"] is None
 
 
 def test_listing_includes_a_successful_transcript(
@@ -379,6 +390,7 @@ def test_deleting_a_recording_removes_its_sidecars(
 ) -> None:
     recording_id, path = _store(storage_dir, _wav())
     _write_sidecar(path, text="hello")
+    _write_answer_sidecar(path, text="Paris.")
 
     response = client.delete(f"/api/recordings/{recording_id}")
 
@@ -386,12 +398,99 @@ def test_deleting_a_recording_removes_its_sidecars(
     assert not path.exists()
     assert not path.with_suffix(".txt").exists()
     assert not path.with_suffix(".transcript.json").exists()
+    assert not path.with_suffix(".answer.json").exists()
 
 
-def test_the_page_renders_transcripts(client: TestClient) -> None:
+# Answers -------------------------------------------------------------------
+
+
+def test_listing_includes_a_successful_answer(
+    client: TestClient, storage_dir: pathlib.Path
+) -> None:
+    _, path = _store(storage_dir, _wav())
+    _write_sidecar(path, text="What is a thunderhead?")
+    _write_answer_sidecar(
+        path,
+        text="A thunderhead is the flat, anvil-shaped top of a cumulonimbus cloud.",
+        model="mistralai/mistral-small-24b-instruct-2501",
+        usage={"cost": 0.0000061},
+        updated_at="2026-11-11T12:00:01+00:00",
+    )
+
+    answer = client.get("/api/recordings").json()["recordings"][0]["answer"]
+
+    assert answer["status"] == "ok"
+    assert answer["text"].startswith("A thunderhead is")
+    assert answer["model"] == "mistralai/mistral-small-24b-instruct-2501"
+    assert answer["cost_usd"] == 0.0000061
+    assert answer["retryable"] is False
+
+
+def test_listing_includes_a_failed_answer(
+    client: TestClient, storage_dir: pathlib.Path
+) -> None:
+    _, path = _store(storage_dir, _wav())
+    _write_answer_sidecar(
+        path,
+        status="error",
+        text="",
+        error="OpenRouter rate-limited the request.",
+        retryable=True,
+    )
+
+    answer = client.get("/api/recordings").json()["recordings"][0]["answer"]
+
+    assert answer["status"] == "error"
+    assert answer["retryable"] is True
+    assert "rate-limited" in answer["error"]
+
+
+def test_answer_fields_are_retyped_and_capped(
+    client: TestClient, storage_dir: pathlib.Path
+) -> None:
+    _, path = _store(storage_dir, _wav())
+    _write_answer_sidecar(
+        path,
+        status="something-else",
+        text="x" * 9000,
+        error="y" * 900,
+        usage={"cost": "free"},
+    )
+
+    answer = client.get("/api/recordings").json()["recordings"][0]["answer"]
+
+    assert answer["status"] == "unknown"
+    assert len(answer["text"]) == 4000
+    assert len(answer["error"]) == 500
+    assert answer["cost_usd"] is None
+
+
+def test_a_malformed_answer_sidecar_does_not_break_the_listing(
+    client: TestClient, storage_dir: pathlib.Path
+) -> None:
+    _, path = _store(storage_dir, _wav())
+    path.with_suffix(".answer.json").write_text("{not json", encoding="utf-8")
+
+    response = client.get("/api/recordings")
+
+    assert response.status_code == 200
+    assert response.json()["recordings"][0]["answer"] is None
+
+
+def test_the_page_renders_answers_and_collapses_details(
+    client: TestClient,
+) -> None:
     page = client.get("/").text
 
+    assert "Kindle Voice LLM Interface" in page
+    assert "stat-answered" not in page
+    assert "Local development review page" not in page
     assert "item.transcript" in page
+    assert "item.answer" in page
     assert "Transcribing" in page
     assert "Transcription failed" in page
+    assert "Waiting for answer" in page
+    assert "Answer failed" in page
+    assert "Details" in page
+    assert "SHA-256" in page
     assert "schedulePoll" in page

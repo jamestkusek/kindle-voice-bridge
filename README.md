@@ -1,8 +1,31 @@
 # Kindle Voice Bridge
 
-Kindle Voice Bridge records the microphone of a Bluetooth headset on a Kindle
-Paperwhite 10th edition. The computer stores each recording, plays it in a
-review page, and can transcribe it through OpenRouter.
+Ask an LLM a question out loud while reading on a Kindle.
+
+## Why
+
+The Kindle's on-screen keyboard is slow and clumsy. Typing a question breaks the
+reading flow, so in practice you stop asking. This project turns the question
+into a spoken sentence instead: a Bluetooth headset captures it, the receiver
+transcribes it, an LLM answers it, and the answer appears back in KOReader.
+
+The Kindle has no microphone or speaker, but it supports Bluetooth audio for
+VoiceView, and a Bluetooth headset has a microphone. The project uses that path.
+
+## What it does
+
+1. The KOReader plugin starts a short capture from the headset.
+2. The Kindle uploads the WAV over Wi-Fi to a small FastAPI receiver on your
+   computer.
+3. The receiver transcribes the audio with OpenRouter, asks a cheap LLM for a
+   short answer, and writes both next to the recording.
+4. The plugin polls for the answer and shows it in a popup.
+5. A local dashboard lists recordings, transcripts and answers, and refreshes
+   live as new ones arrive.
+
+This is a development prototype. The receiver runs on your computer, the LAN
+connection is plain HTTP, and the dashboard is unauthenticated. Read the security
+boundary below before using it.
 
 ## Before you start
 
@@ -13,9 +36,8 @@ unusable. Recovery is not guaranteed, so read
 ## Security boundary
 
 By default the receiver listens on all interfaces, and HTTP exposes the token
-and the audio on the network. The review page is unauthenticated, so use a
-trusted network only and read [docs/review-ui.md](docs/review-ui.md) for the
-detail.
+and the audio on the network. The dashboard is unauthenticated, so use a trusted
+network only and read [docs/review-ui.md](docs/review-ui.md) for the detail.
 
 ## Requirements
 
@@ -50,16 +72,20 @@ python -m pip install -e .
 .\tools\kvb.ps1 receiver
 ```
 
-The receiver answers at `http://127.0.0.1:18767/healthz`. The review page is at
+The health check is at `http://127.0.0.1:18767/healthz`. The dashboard is at
 `http://127.0.0.1:18767/`.
 
 The command creates a token when none exists and never prints it. It stores
 recordings in `%LOCALAPPDATA%\KindleVoiceBridge\recordings`. It turns
-transcription on when
+transcription and answering on when
 `server/voice_bridge_server/voxtral-openrouter-key.txt` exists.
 
-Add `-LocalOnly` to bind `127.0.0.1` only. The command prints the process ID.
-Stop the receiver with `Stop-Process -Id <pid>`.
+Add `-LocalOnly` to bind `127.0.0.1` only. Stop or restart the receiver with:
+
+```powershell
+.\tools\kvb.ps1 stop
+.\tools\kvb.ps1 restart
+```
 
 If the execution policy blocks the script, run this command:
 
@@ -96,10 +122,15 @@ To write the file by hand, create it with this content:
 1. Open the Voice Bridge plugin in KOReader.
 2. Select **Start Bluetooth session**. Confirm the action.
 3. Select **Ask question**. A strip opens along the bottom edge of the screen.
+   You can also assign the **Voice Bridge: start/stop recording** Dispatcher
+   action to a gesture.
 4. Wait for **SPEAK NOW** and the countdown.
 5. Ask the question, then tap the strip to stop and send.
 6. The strip shows **SENT**, then **RESPONSE READY** when the answer arrives.
 7. Tap the strip to read the answer. Closing the popup closes the strip.
+
+The dashboard at `http://127.0.0.1:18767/` shows the recording, its transcript
+and the answer, and updates live as new ones arrive.
 
 ## Where to go next
 
@@ -109,7 +140,8 @@ To write the file by hand, create it with this content:
   capture commands, and the resident session protocol.
 - [docs/transcription.md](docs/transcription.md): the model comparison and the
   cost per clip.
-- [docs/review-ui.md](docs/review-ui.md): the review page and its endpoints.
+- [docs/review-ui.md](docs/review-ui.md): the dashboard and its endpoints.
 - [docs/recovery.md](docs/recovery.md): the Bluetooth recovery commands.
 - [docs/one-pager.md](docs/one-pager.md): the project pitch and the next steps.
-- [PLAN.md](PLAN.md): the project plan and the hardware precautions.
+- [ai.md](ai.md): how AI was used to build the project.
+- [PLAN.md](PLAN.md): the original project plan and the hardware precautions.
