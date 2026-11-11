@@ -79,6 +79,10 @@ credentials.json
 credentials.yaml
 credentials.yml
 token.json
+# API keys dropped next to the code for a quick test. Keep them out of git.
+*openrouter-key*
+*-key.txt
+*-api-key*
 
 # Local configuration; example files stay tracked
 config/*.json

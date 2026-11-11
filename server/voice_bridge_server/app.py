@@ -23,10 +23,10 @@ import os
 import pathlib
 import secrets
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import ClientDisconnect
@@ -35,6 +35,8 @@ from .audio import WavError, parse_wav
 from .config import Settings
 from .review import register_review_routes
 from .storage import LocalFileStore, RecordingStore, new_recording_id
+from .transcribe import DEFAULT_MODEL as DEFAULT_TRANSCRIBE_MODEL
+from .transcripts import transcribe_recording
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -74,8 +76,14 @@ def create_app(
     settings: Settings,
     *,
     store: RecordingStore | None = None,
+    transcribe: Callable[[pathlib.Path], object] | None = None,
 ) -> FastAPI:
-    """Build the ASGI application and validate the storage directory."""
+    """Build the ASGI application and validate the storage directory.
+
+    ``transcribe`` is an optional callable that receives the stored path of each
+    accepted recording. It runs as a background task after the response is sent,
+    so the upload contract never depends on it. ``None`` disables transcription.
+    """
 
     _prepare_storage(settings.storage_dir)
 
@@ -91,6 +99,7 @@ def create_app(
     )
 
     app.state.settings = settings
+    app.state.transcribe = transcribe
     app.state.store = (
         store if store is not None else LocalFileStore(settings.storage_dir)
     )
@@ -99,8 +108,12 @@ def create_app(
 
     @app.post("/v1/recordings", include_in_schema=False)
     @app.post("/v1/recordings/", include_in_schema=False)
-    async def upload_recording(request: Request) -> Response:
-        return await _handle_upload(request, settings, app.state.store)
+    async def upload_recording(
+        request: Request, background: BackgroundTasks
+    ) -> Response:
+        return await _handle_upload(
+            request, settings, app.state.store, background, transcribe
+        )
 
     @app.api_route(
         "/healthz",
@@ -174,13 +187,36 @@ def create_app_from_env(
         storage_dir=storage_dir,
         **settings_kwargs,
     )
-    return create_app(settings)
+    return create_app(settings, transcribe=_transcriber_from_env(env))
+
+
+def _transcriber_from_env(
+    env: Mapping[str, str],
+) -> Callable[[pathlib.Path], object] | None:
+    """Return a transcription callable, or ``None`` when it is not configured.
+
+    Transcription is opt-in: without ``OPENROUTER_API_KEY`` the receiver behaves
+    exactly as before and never makes an outbound request. ``KVB_TRANSCRIBE_MODEL``
+    overrides the model.
+    """
+
+    api_key = env.get("OPENROUTER_API_KEY", "")
+    if not api_key.strip():
+        return None
+    model = env.get("KVB_TRANSCRIBE_MODEL", "").strip() or DEFAULT_TRANSCRIBE_MODEL
+
+    def transcribe(path: pathlib.Path) -> object:
+        return transcribe_recording(path, api_key, model=model)
+
+    return transcribe
 
 
 async def _handle_upload(
     request: Request,
     settings: Settings,
     store: RecordingStore,
+    background: BackgroundTasks | None = None,
+    transcribe: Callable[[pathlib.Path], object] | None = None,
 ) -> Response:
     # 2. Authentication runs before every body check.
     authorization_values = request.headers.getlist("authorization")
@@ -290,7 +326,7 @@ async def _handle_upload(
     # 8. Storage. The app returns a 201 only after the write completes.
     recording_id = new_recording_id()
     try:
-        store.save(recording_id, body)
+        stored_path = store.save(recording_id, body)
     except OSError:
         logger.warning(
             "storage_error bytes=%d", len(body)
@@ -322,7 +358,25 @@ async def _handle_upload(
         len(body),
         wav_info.duration_seconds,
     )
+
+    # 9. Transcription, when it is configured. The task runs after the response
+    # is sent, so it cannot change the status or the body. A failure is logged
+    # by type only, never with audio or credentials.
+    if transcribe is not None and background is not None:
+        background.add_task(_transcribe_quietly, transcribe, stored_path)
+
     return _json_response(payload, 201)
+
+
+def _transcribe_quietly(
+    transcribe: Callable[[pathlib.Path], object], path: pathlib.Path
+) -> None:
+    """Run one transcription without letting it reach the upload path."""
+
+    try:
+        transcribe(path)
+    except Exception as exc:
+        logger.warning("transcribe_error type=%s", type(exc).__name__)
 
 
 def _token_matches(value: str, expected: str) -> bool:

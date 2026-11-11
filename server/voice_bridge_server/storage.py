@@ -15,12 +15,18 @@ from __future__ import annotations
 
 import os
 import pathlib
+import re
 import secrets
 import uuid
 from datetime import datetime, timezone
 from typing import Protocol
 
 _RECORDING_ID_HEX_BYTES = 16
+
+#: The exact ID format from ``docs/protocol.md`` §9.2. ``fullmatch`` is used so
+#: no prefix, suffix, separator or path component can slip through. The review
+#: routes and the transcription worker both validate against this one pattern.
+RECORDING_ID_PATTERN = re.compile(r"rec_[0-9]{8}T[0-9]{6}Z_[0-9a-f]{32}")
 
 
 class RecordingStore(Protocol):
