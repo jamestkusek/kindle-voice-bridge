@@ -286,6 +286,17 @@ about $0.0015. OpenRouter has no transcription endpoint. The audio travels as an
 clip, and what to try if 8 kHz audio transcribes poorly are in
 [transcription.md](transcription.md).
 
+When the transcript is not empty, a second call asks a chat model for a short
+answer to the question. The default is
+`mistralai/mistral-small-24b-instruct-2501`, about $0.000006 per answer. The
+answer is written to `<id>.answer.json`.
+
+The daemon reads the answer through `GET /v1/recordings/{id}/answer`, which uses
+the same bearer token as the upload. The endpoint returns `pending`, `ready` or
+`failed`. The daemon polls once per second for up to 60 seconds and publishes
+the text as the second line of the state file. The plugin shows **RESPONSE
+READY** in the strip, and a tap opens the text in a popup.
+
 ## Host helper
 
 The `tools\kvb.ps1` script is the single entry point for the host operations.

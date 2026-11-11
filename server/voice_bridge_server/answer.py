@@ -27,7 +27,7 @@ from .transcribe import ENDPOINT, PermanentError, TransientError, Transport
 
 #: Cheap and fast. The answer is a couple of sentences, so a large model buys
 #: nothing here.
-DEFAULT_ANSWER_MODEL = "google/gemini-2.5-flash-lite"
+DEFAULT_ANSWER_MODEL = "mistralai/mistral-small-24b-instruct-2501"
 
 #: The transcript comes from an 8 kHz headset mic, so it may be a question, a
 #: fragment, or noise. The prompt keeps the reply short either way and forbids

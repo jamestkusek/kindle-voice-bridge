@@ -79,6 +79,26 @@ For comparison, `google/gemini-2.5-flash-lite` at $0.0000003 per audio token wit
 times cheaper. So if volume matters, Gemini is the cheap option and Voxtral is
 the accuracy option. At prototype volume the difference is cents.
 
+## The answer model
+
+After the transcript, the receiver asks a second model for a short answer to the
+question. The default is `mistralai/mistral-small-24b-instruct-2501`. Override it
+with `KVB_ANSWER_MODEL`.
+
+The answer is two sentences, so a large model buys nothing. Measured on the
+question "what is a thunderhead?":
+
+| Model | Prompt / completion per million | Answer | Cost |
+| --- | --- | --- | --- |
+| `mistralai/mistral-nemo` | $0.029 / $0.030 | one sentence | $0.0000015 |
+| `mistralai/mistral-small-24b-instruct-2501` | $0.050 / $0.080 | two sentences | $0.0000061 |
+| `mistralai/ministral-3b-2512` | $0.100 / $0.100 | two sentences | $0.0000107 |
+| `google/gemini-2.5-flash-lite` | $0.100 / $0.400 | two sentences | $0.0000198 |
+
+Mistral Small 24B is the default because it gave the clearer two-sentence
+answer at a cost that is not worth tuning further. Use `mistral-nemo` when one
+sentence is enough and the lowest cost matters.
+
 ### If the transcripts come back poor
 
 The recordings are 8 kHz mono PCM16. Voxtral is trained around 16 kHz, and the
