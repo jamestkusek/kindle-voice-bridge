@@ -87,7 +87,7 @@ CONTROL_TIMEOUT = 5.0
 CONTROL_LINE_LIMIT = 1024
 RECORD_CLIENT_TIMEOUT = 200.0
 MAX_MANUAL_RECORD_SECONDS = 15.0
-DEFAULT_IDLE_TIMEOUT = 600
+DEFAULT_IDLE_TIMEOUT = 1800
 STARTUP_SECONDS = 120
 CLEANUP_RESERVE_SECONDS = 30.0
 LINK_DEADLINE_SECONDS = 90.0
@@ -1354,7 +1354,7 @@ def build_parser():
     parser.add_argument("--idle-timeout", type=positive_int, default=DEFAULT_IDLE_TIMEOUT,
                         metavar="SECONDS",
                         help="Stop after this many seconds without a recording. "
-                             "The default is 600.")
+                             "The default is 1800.")
     parser.add_argument("--keep-latency", action="store_true",
                         help="Keep the CPU latency hold for the whole session. "
                              "The default releases it between recordings.")

@@ -269,7 +269,7 @@ Deploy steps:
    ```
 
 Add `--headset 95:05:BB:2A:34:2E` when the pairing store holds more than one
-device. Add `--idle-timeout 600` to change the idle limit. Add `--keep-latency`
+device. Add `--idle-timeout 1800` to change the idle limit. Add `--keep-latency`
 to keep the CPU latency hold for the whole session. Add `--send-silence` to send
 paced silent downlink audio during each capture. The default is off.
 
@@ -333,7 +333,7 @@ one-shot path has the same flag. The log line and the comparison are in
 
 ### Idle and power
 
-- The default idle limit is 600 seconds. The daemon restores Bluetooth after
+- The default idle limit is 1800 seconds. The daemon restores Bluetooth after
   that limit without a recording.
 - The daemon releases the CPU latency hold between recordings and re-acquires
   the hold for each capture. The tests do not cover this with the controller
