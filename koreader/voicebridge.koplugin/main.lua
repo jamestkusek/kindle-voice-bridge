@@ -20,7 +20,6 @@ local _ = require("gettext")
 local base_path = "/mnt/us/kindle-voice-bridge"
 local state_path = "/tmp/voicebridge-bt-session.state"
 local command_path = "/tmp/voicebridge-bt-session.cmd"
-local manual_start_log_path = base_path .. "/manual-record-start.log"
 
 
 
@@ -39,27 +38,6 @@ local manual_start_log_path = base_path .. "/manual-record-start.log"
 -- It is additive. An older daemon replies with an error, and the plugin keeps
 -- the preparing message until the result arrives.
 
-local session_start_recording_command = [[
-exec 2>&1
-runtime_home=/mnt/us/kindle-voice-bridge/python31117
-runtime="$runtime_home/bin/python3.11"
-if [ ! -f "$runtime" ]; then
-    printf 'error The bundled Python is missing.\n'
-    printf '\nManual recording start finished.\n'
-    exit 1
-fi
-(
-    unset PYTHONPATH PYTHONSTARTUP PYTHONUSERBASE VIRTUAL_ENV
-    PYTHONHOME="$runtime_home"
-    PYTHONNOUSERSITE=1
-    PYTHONDONTWRITEBYTECODE=1
-    LD_LIBRARY_PATH="$runtime_home/lib"
-    export PYTHONHOME PYTHONNOUSERSITE PYTHONDONTWRITEBYTECODE LD_LIBRARY_PATH
-    ulimit -c 0 2>/dev/null || :
-    "$runtime" -B /mnt/us/kindle-voice-bridge/bt_session.py --client start_recording --timeout 200
-)
-printf '\nManual recording start finished.\n'
-]]
 
 
 -- Manual start only. The daemon performs the Bluetooth handoff once and
@@ -554,14 +532,6 @@ function RecordPage:apply(state)
 end
 
 function RecordPage:start_error()
-    local text = read(manual_start_log_path)
-    if text then
-        for line in text:gmatch("[^\n]+") do
-            if line:match("^error%s") then
-                return (line:gsub("^error%s+", ""))
-            end
-        end
-    end
     return _("The recording did not start. Start the Bluetooth session first.")
 end
 
@@ -686,16 +656,14 @@ function VoiceBridge:startManualRecording()
         return
     end
 
-    os.remove(manual_start_log_path)
-    local pipe = io.popen("(" .. session_start_recording_command .. ") > " ..
-        manual_start_log_path .. " 2>&1 &", "r")
-    if not pipe then
+    -- The daemon polls this file every 100 ms. Starting a client process takes
+    -- several seconds on the device, which is longer than the bar will wait.
+    if not write_command(command_path, "start_recording\n") then
         UIManager:show(InfoMessage:new{
-            text = _("The plugin could not start manual recording."),
+            text = _("The plugin could not start the recording."),
         })
         return
     end
-    pcall(pipe.close, pipe)
     self.record_page = RecordPage:new{ phase = "waiting" }
     self.record_page:start()
 end

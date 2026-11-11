@@ -712,3 +712,39 @@ def test_the_state_file_has_an_answer_line(tmp_path):
     session.write_state_file()
     lines = (tmp_path / "session.state").read_text(encoding="ascii").splitlines()
     assert lines[1] == "answer A short answer."
+
+
+def test_command_file_starts_a_manual_recording(tmp_path):
+    controller = ManualController()
+    session, capture_local, uploader, experiment = build_session(tmp_path, controller)
+    session.controller = controller
+    command_path = tmp_path / "session.cmd"
+    command_path.write_text("start_recording\n", encoding="ascii")
+
+    async def scenario():
+        session.poll_command_file()
+        await asyncio.sleep(0.05)
+        return session.recording, session.record_kind, session.record_task
+
+    recording, kind, task = asyncio.run(scenario())
+
+    assert recording is True
+    assert kind == "manual"
+    assert task is not None
+    assert not command_path.exists()
+
+
+def test_command_file_does_not_start_a_second_recording(tmp_path):
+    controller = ManualController()
+    session, capture_local, uploader, experiment = build_session(tmp_path, controller)
+    command_path = tmp_path / "session.cmd"
+    session.recording = True
+    session.record_kind = "manual"
+    command_path.write_text("start_recording\n", encoding="ascii")
+
+    async def scenario():
+        session.poll_command_file()
+        await asyncio.sleep(0.05)
+        return session.record_task
+
+    assert asyncio.run(scenario()) is None

@@ -74,8 +74,6 @@ import stat
 import struct
 import sys
 import time
-import urllib.error
-import urllib.request
 
 try:
     import fcntl
@@ -352,6 +350,9 @@ class Session:
         self.answer_task = asyncio.create_task(self.fetch_answer(recording_id))
 
     def _get_answer(self, url):
+        # Imported here so the --client path does not pay for the load.
+        import urllib.request
+
         request = urllib.request.Request(
             url, headers={"Authorization": f"Bearer {self.config['token']}"})
         with urllib.request.urlopen(
@@ -478,6 +479,8 @@ class Session:
             event = self.manual_stop_event
             if event is not None and self.recording:
                 event.set()
+        elif command == "start_recording":
+            asyncio.create_task(self.start_from_command())
 
     def remove_command_file(self):
         if not self.command_path:
@@ -541,27 +544,38 @@ class Session:
         except asyncio.CancelledError:
             return "error stopped. The recording was stopped."
 
+    def _begin_manual_recording(self):
+        """Create the manual capture task. The caller holds record_state_lock."""
+        loop = asyncio.get_running_loop()
+        ready = loop.create_future()
+        stop_requested = asyncio.Event()
+        self.recording = True
+        self.record_kind = "manual"
+        self.manual_stop_event = stop_requested
+        self.last_record_result = None
+        self.last_answer = None
+        self.last_recording_id = None
+        self.set_phase("preparing")
+        task = asyncio.create_task(self._manual_recording(ready, stop_requested))
+        self.record_task = task
+        return ready
+
     async def start_recording_line(self):
         """Prepare SCO and reply as soon as its audio callback is installed."""
-        loop = asyncio.get_running_loop()
         async with self.record_state_lock:
             if self.stop_event.is_set():
                 return "error stopping. The session is stopping."
             if self.recording:
                 return "error busy. A recording is already running."
-            ready = loop.create_future()
-            stop_requested = asyncio.Event()
-            self.recording = True
-            self.record_kind = "manual"
-            self.manual_stop_event = stop_requested
-            self.last_record_result = None
-            self.last_answer = None
-            self.last_recording_id = None
-            self.set_phase("preparing")
-            task = asyncio.create_task(
-                self._manual_recording(ready, stop_requested))
-            self.record_task = task
+            ready = self._begin_manual_recording()
         return await asyncio.shield(ready)
+
+    async def start_from_command(self):
+        """Start a manual capture for the plugin, which watches the state file."""
+        async with self.record_state_lock:
+            if self.stop_event.is_set() or self.recording:
+                return
+            self._begin_manual_recording()
 
     async def stop_recording_line(self):
         """Stop the active manual capture and await its one upload result."""
