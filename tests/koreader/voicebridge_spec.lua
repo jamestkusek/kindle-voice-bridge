@@ -170,12 +170,12 @@ end
 -- Drive the page -----------------------------------------------------------
 
 local heartbeat = 0
-local function publish(phase, elapsed_ms, remaining_ms, link, result)
+local function publish(phase, elapsed_ms, remaining_ms, link, result, answer)
     heartbeat = heartbeat + 1
     local file = assert(io.open(STATE, "w"))
-    file:write(string.format("v1 %d %s %d %d %s %s\n",
+    file:write(string.format("v1 %d %s %d %d %s %s\nanswer %s\n",
         heartbeat, phase, elapsed_ms, remaining_ms, link or "connected",
-        result or "-"))
+        result or "-", answer or "-"))
     file:close()
 end
 
@@ -243,7 +243,8 @@ page:tick()
 equal(page.phase, "done", "a successful result ends the page")
 equal(page:state_word(), "SENT", "done word")
 equal(page:result_word(), "sent rec_9 2.20s", "the result text is shown")
-check(page.closed, "the page stops ticking after the result")
+check(not page.closed, "the bar stays open for the answer")
+check(page.waiting, "the bar is waiting for the answer")
 
 -- 7. The 15-second cap ends the recording without a tap.
 publish("recording", 14900, 100)
@@ -321,6 +322,26 @@ local handle = assert(io.open(command_file, "r"), "the command file was written"
 equal(handle:read("*l"), "stop_recording", "the stop command is written")
 handle:close()
 os.remove(command_file)
+
+-- 15. The answer turns the bar into a prompt, and closing it closes the bar.
+publish("recording", 100, 14900)
+page = new_page()
+page:tick()
+page:onTapStop()
+publish("idle", -1, -1, "connected", "ok sent rec_11 3.00s")
+page:tick()
+equal(page.phase, "done", "the capture ended")
+check(page.waiting, "the bar waits for the answer")
+equal(page:hint_word(), "Waiting for the answer…", "the hint says it is waiting")
+publish("idle", -1, -1, "connected", "ok sent rec_11 3.00s", "It is a cloud.")
+page:tick()
+equal(page.phase, "answer", "the answer phase is shown")
+equal(page:state_word(), "RESPONSE READY", "the answer word")
+page:onTapStop()
+local message = UIManager.shown[#UIManager.shown].widget
+equal(message.text, "It is a cloud.", "the popup shows the answer")
+message.dismiss_callback()
+check(page.closed, "closing the popup closes the bar")
 
 os.remove(STATE)
 os.remove(STATE .. ".bad")

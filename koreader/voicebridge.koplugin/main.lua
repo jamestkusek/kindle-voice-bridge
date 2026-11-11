@@ -850,6 +850,7 @@ local page_tick_seconds = 0.25
 local page_stale_ticks = 6   -- 1.5 s without a heartbeat change
 local page_start_ticks = 20  -- 5 s to leave idle after Start
 local page_stop_ticks = 80   -- 20 s for a stop to finish
+local page_answer_ticks = 260 -- 65 s to wait for the answer
 
 local function write_command(path, text)
     local file = io.open(path, "w")
@@ -863,11 +864,16 @@ local function read_state(path)
     local file = io.open(path or state_path, "r")
     if not file then return nil end
     local line = file:read("*l")
+    local answer_line = file:read("*l")
     file:close()
     if not line then return nil end
     local heartbeat, phase, elapsed, remaining, link, result =
         line:match("^v1 (%d+) (%a+) (%-?%d+) (%-?%d+) (%a+) (.*)$")
     if not heartbeat then return nil end
+    local answer = nil
+    if answer_line then
+        answer = answer_line:match("^answer%s+(.*)$")
+    end
     return {
         heartbeat = tonumber(heartbeat),
         phase = phase,
@@ -875,6 +881,7 @@ local function read_state(path)
         remaining_ms = tonumber(remaining),
         link = link,
         result = result,
+        answer = answer,
     }
 end
 
@@ -891,6 +898,9 @@ local RecordPage = InputContainer:extend{
     stop_ticks = 0,
     stop_requested = false,
     closed = false,
+    waiting = false,
+    answer = nil,
+    answer_ticks = 0,
     state_path = nil,
     command_path = nil,
 }
@@ -932,6 +942,7 @@ function RecordPage:state_word()
     if phase == "preparing" then return _("PREPARING") end
     if phase == "sending" or phase == "stopping" then return _("SENDING") end
     if phase == "done" then return _("SENT") end
+    if phase == "answer" then return _("RESPONSE READY") end
     if phase == "failed" then return _("NOT SENT") end
     if phase == "stale" then return _("NO SESSION") end
     return _("WAITING")
@@ -952,6 +963,11 @@ function RecordPage:hint_word()
         return _("Opening the microphone…")
     elseif phase == "sending" or phase == "stopping" then
         return _("Uploading the recording…")
+    elseif phase == "answer" then
+        return _("Tap the bar to read it")
+    elseif phase == "done" then
+        if self.waiting then return _("Waiting for the answer…") end
+        return _("Tap the bar to close")
     elseif self:is_finished() then
         return _("Tap the bar to close")
     end
@@ -1075,6 +1091,21 @@ function RecordPage:tick()
         self.stale_ticks = 0
     end
     self:apply(state)
+    if self.waiting then
+        if state.answer and state.answer ~= "-" then
+            self.answer = state.answer
+            self.waiting = false
+            self:set_phase("answer")
+        else
+            self.answer_ticks = self.answer_ticks + 1
+            if self.answer_ticks >= page_answer_ticks then
+                -- No answer is coming. Keep the result and let a tap close.
+                self.waiting = false
+                self:rebuild()
+                UIManager:setDirty(self, "ui", self.dimen)
+            end
+        end
+    end
     if not self.closed then
         self:scheduleTick()
     end
@@ -1164,9 +1195,17 @@ function RecordPage:refresh_count()
 end
 
 function RecordPage:finish(kind, result)
-    self.closed = true
     self.phase = kind
     self.result = result
+    if kind == "done" then
+        -- The receiver may still send an answer, so keep polling the state.
+        self.waiting = true
+        self.answer_ticks = 0
+        self:rebuild()
+        UIManager:setDirty(self, "ui", self.dimen)
+        return
+    end
+    self.closed = true
     self:rebuild()
     UIManager:setDirty(self, "ui", self.dimen)
 end
@@ -1197,10 +1236,27 @@ function RecordPage:request_stop()
     end
 end
 
+function RecordPage:close()
+    self.closed = true
+    UIManager:close(self, "ui", self.dimen)
+end
+
+function RecordPage:show_answer()
+    local text = self.answer
+    if not text or text == "-" then return end
+    UIManager:show(InfoMessage:new{
+        text = text,
+        dismiss_callback = function() self:close() end,
+    })
+end
+
 function RecordPage:onTapStop()
+    if self.phase == "answer" then
+        self:show_answer()
+        return
+    end
     if self:is_finished() then
-        self.closed = true
-        UIManager:close(self, "ui", self.dimen)
+        self:close()
         return
     end
     if self.stop_requested then return end
