@@ -6,6 +6,10 @@ bounds every body read, validates the WAV structure and writes local files
 atomically. It never logs the token, the ``Authorization`` header or audio
 bytes, and it never retries.
 
+A local development review UI (``GET /``) and its listing, playback and delete
+routes are attached from :mod:`voice_bridge_server.review`. They are outside the
+upload contract and are unauthenticated; see that module for the safety rules.
+
 Binding and transport (uvicorn ``--host``/``--port``, TLS termination) are
 outside this module. ``create_app`` never reads the environment. Use
 :func:`create_app_from_env` for the uvicorn factory.
@@ -29,6 +33,7 @@ from starlette.requests import ClientDisconnect
 
 from .audio import WavError, parse_wav
 from .config import Settings
+from .review import register_review_routes
 from .storage import LocalFileStore, RecordingStore, new_recording_id
 
 logger = logging.getLogger(__name__)
@@ -89,6 +94,8 @@ def create_app(
     app.state.store = (
         store if store is not None else LocalFileStore(settings.storage_dir)
     )
+
+    register_review_routes(app, settings)
 
     @app.post("/v1/recordings", include_in_schema=False)
     @app.post("/v1/recordings/", include_in_schema=False)
