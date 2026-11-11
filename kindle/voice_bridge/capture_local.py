@@ -98,6 +98,10 @@ MAX_SETTLE_SECONDS = 10.0
 # floor; digital silence and the startup DC plateau have none. This threshold is
 # far below SETTLE_RMS_MIN because it decides "converting", not "speech".
 AUDIO_READY_RMS = 4.0
+# The startup artifact is a DC plateau around 21,000 counts with a little AC
+# ripple, so AC energy alone cannot reject it. The cue needs the DC test as
+# well, over a short window so one odd packet cannot decide.
+AUDIO_READY_WINDOW_SECONDS = 0.20
 # If no signal appears, start anyway so a quiet headset cannot stall the run.
 AUDIO_READY_TIMEOUT = 4.0
 
@@ -414,6 +418,20 @@ class Capture:
         self.first_signal_at = None
         self.first_speech_at = None
         self.max_ac_rms = 0.0
+        self.max_dc = 0.0
+        # Before the cue there is no duration budget, so bound the buffer by
+        # the readiness timeout instead and cue when it is reached.
+        self.pre_cue_limit = int(
+            (AUDIO_READY_TIMEOUT + 1.0) * SAMPLE_RATE * SAMPLE_WIDTH)
+        # Decides the cue: no DC plateau and some AC energy. This is the settle
+        # detector with a much lower RMS floor and no zero-crossing rule,
+        # because it decides "converting", not "speech".
+        self.ready = SettleDetector(
+            window_seconds=AUDIO_READY_WINDOW_SECONDS,
+            mean_limit=SETTLE_MEAN_LIMIT,
+            zcr_min=0.0,
+            rms_min=AUDIO_READY_RMS,
+        )
         # Measurement only. It never decides anything on the manual path.
         self.probe = SettleDetector()
         # Hold only the tail that a settle decision can still reach back to.
@@ -434,6 +452,10 @@ class Capture:
         if self.detector is None:
             self._note_arrival(payload)
             self._store(payload)
+            if self.cue_offset is None:
+                if len(self.data) >= self.pre_cue_limit:
+                    self.force_cue()
+                return
             if self._stored_after_cue() >= self.max_pcm_bytes:
                 self.max_duration_reached = True
                 self.stop.set()
@@ -461,20 +483,35 @@ class Capture:
         level = ac_rms(payload)
         if level > self.max_ac_rms:
             self.max_ac_rms = level
-        if self.first_signal_at is None and level > AUDIO_READY_RMS:
+        count = len(payload) // 2
+        if count:
+            samples = struct.unpack(f"<{count}h", payload[:count * 2])
+            dc = abs(sum(samples) / count)
+            if dc > self.max_dc:
+                self.max_dc = dc
+        if self.cue_offset is None and self.ready.feed(payload):
+            # Keep from the start of the window that passed, so the cue has a
+            # short pre-roll and no part of the accepted audio is trimmed.
+            start = int(round(self.ready.settle_seconds * SAMPLE_RATE))
+            self.cue_offset = min(start * SAMPLE_WIDTH, len(self.data))
+            self.cue_at = now
             self.first_signal_at = now
-            if self.cue_offset is None:
-                # Cue before this packet, so the packet that proved the
-                # microphone is live is the first sample kept.
-                self.cue_offset = len(self.data)
-                self.cue_at = now
-                self.audio_event.set()
+            self.audio_event.set()
         if self.first_speech_at is None and self.probe.feed(payload):
             self.first_speech_at = now
 
     def _stored_after_cue(self):
-        """Return the bytes stored since the cue, or all bytes before it."""
-        return len(self.data) - (self.cue_offset or 0)
+        """Return the bytes that count against the duration budget.
+
+        The settle path has no cue, so every byte counts. The manual path counts
+        only bytes after the cue: there is no budget until the user is told to
+        speak, and the pre-cue buffer has its own bound.
+        """
+        if self.cue_offset is not None:
+            return len(self.data) - self.cue_offset
+        if self.detector is None:
+            return 0
+        return len(self.data)
 
     def force_cue(self):
         """Cue without a signal, for a headset that never reports a noise floor."""
@@ -495,8 +532,9 @@ class Capture:
 
         return (
             f"Audio: first packet {at(self.first_packet_at)}, "
-            f"first signal {at(self.first_signal_at)} "
-            f"(threshold {AUDIO_READY_RMS:g}, peak {self.max_ac_rms:.1f}), "
+            f"mic live {at(self.first_signal_at)} "
+            f"(window {AUDIO_READY_WINDOW_SECONDS:g} s, "
+            f"peak DC {self.max_dc:.0f}, peak AC RMS {self.max_ac_rms:.0f}), "
             f"first speech {at(self.first_speech_at)} after SCO open."
         )
 
