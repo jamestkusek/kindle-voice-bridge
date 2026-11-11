@@ -227,14 +227,10 @@ class Experiment:
         read_power()
         self.btd, self.bsa, self.btfd = snapshot()
 
-    def handoff(self, budget=210.0):
-        """Stop btd and take the UART from bsa_server. Call cleanup() after."""
-        self.deadline = time.monotonic() + budget
-        read_power()
-        current = snapshot()
-        if tuple(map(identity, current)) != tuple(
-                map(identity, (self.btd, self.bsa, self.btfd))):
-            raise RuntimeError("Bluetooth process identities changed before handoff.")
+    def acquire_latency(self):
+        """Request zero CPU latency. Call release_latency() to remove it."""
+        if self.latency_fd is not None:
+            return
         blocked = {signal.SIGALRM, signal.SIGTERM, signal.SIGINT}
         old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
         try:
@@ -244,6 +240,25 @@ class Experiment:
         request = struct.pack("=i", 0)
         if os.write(self.latency_fd, request) != len(request):
             raise OSError("The CPU latency request was not fully written.")
+
+    def release_latency(self):
+        """Remove the CPU latency request. Safe to call more than once."""
+        if self.latency_fd is None:
+            return
+        fd = self.latency_fd
+        os.close(fd)
+        self.latency_fd = None
+
+    def handoff(self, budget=210.0):
+        """Stop btd and take the UART from bsa_server. Call cleanup() after."""
+        self.deadline = time.monotonic() + budget
+        read_power()
+        current = snapshot()
+        if tuple(map(identity, current)) != tuple(
+                map(identity, (self.btd, self.bsa, self.btfd))):
+            raise RuntimeError("Bluetooth process identities changed before handoff.")
+        self.acquire_latency()
+        blocked = {signal.SIGALRM, signal.SIGTERM, signal.SIGINT}
         old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
         try:
             self.check_client()
@@ -348,7 +363,7 @@ class Experiment:
             self.attempt("restore UART settings after handover",
                          self.restore_uart_settings)
         if self.latency_fd is not None:
-            self.attempt("close CPU latency request", lambda: os.close(self.latency_fd))
+            self.attempt("close CPU latency request", self.release_latency)
         if self.client is not None:
             self.attempt("close client", self.client.close)
         if self.stopped:

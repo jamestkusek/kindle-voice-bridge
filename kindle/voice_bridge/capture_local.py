@@ -24,6 +24,10 @@ The capture code is a reduced copy of tools/hfp_capture.py. That tool is a
 laptop listener and is not deployed to the device. Keep the settle thresholds
 in step with it.
 
+--send-silence sends paced silent PCM downlink packets during the capture. Some
+handsets start their microphone only after downlink audio arrives. The option is
+off by default, so the capture path is unchanged unless the user asks for it.
+
 The run is bounded three ways: a wall-clock alarm, a capture deadline, and a
 maximum usable audio length. A stream that never looks live is a failure, not a
 recording.
@@ -43,6 +47,7 @@ import time
 import wave
 import xml.etree.ElementTree as ET
 from collections import deque
+from dataclasses import dataclass
 
 if __package__:
     from . import pw4_supervisor, uploader
@@ -151,28 +156,32 @@ class CaptureFailure(Exception):
 # Configuration and pairing store
 # -----------------------------------------------------------------------------
 def read_config(path):
-    """Read and delete the upload configuration.
+    """Read the upload configuration and leave the file in place.
 
-    The token must not persist on the device, so the file is removed as soon as
-    it is read. A failed run needs a new copy.
+    The file is the user's configuration, so reading it must not destroy it.
+    Later runs reuse the same file. The token stays on the device in plain
+    text, which is acceptable only for the trusted-LAN prototype.
     """
     try:
         with open(path, "r", encoding="utf-8") as source:
             text = source.read()
+    except FileNotFoundError as error:
+        raise SetupError(
+            f"upload.json is missing at {path}. Write "
+            '{"server_url": ..., "token": ...} there and start the session again.'
+        ) from error
     except OSError as error:
-        raise SetupError(f"The configuration file {path} cannot be read.") from error
-    try:
-        os.remove(path)
-    except OSError:
-        pass
+        raise SetupError(f"The configuration file at {path} cannot be read.") from error
     try:
         config = json.loads(text)
     except (ValueError, RecursionError) as error:
-        raise SetupError("The configuration file is not valid JSON.") from error
+        raise SetupError(
+            f"The configuration file at {path} is not valid JSON.") from error
     if (not isinstance(config, dict) or
             not isinstance(config.get("server_url"), str) or not config["server_url"] or
             not isinstance(config.get("token"), str) or not config["token"]):
-        raise SetupError("The configuration needs non-empty server_url and token strings.")
+        raise SetupError(
+            f"The configuration at {path} needs non-empty server_url and token strings.")
     return config
 
 
@@ -328,20 +337,49 @@ class SettleDetector:
         return False
 
 
-class Capture:
-    """Collect SCO payloads as PCM, after the settle detector accepts them."""
+@dataclass(frozen=True)
+class CaptureReport:
+    """The result of one capture, with the measurements the log needs."""
 
-    def __init__(self):
+    pcm: bytes
+    settle_seconds: float | None
+    settle_after_sco_seconds: float | None
+    silence_used: bool
+    silence_error: str | None
+
+
+class Capture:
+    """Collect SCO PCM, optionally applying the one-shot settle detector.
+
+    The resident manual-recording path uses ``settle=False``. It stores the
+    first valid packet immediately and bounds the buffer to ``max_duration``.
+    """
+
+    def __init__(self, settle=True, max_duration=DURATION):
+        if max_duration <= 0:
+            raise ValueError("max_duration must be greater than zero")
         self.data = bytearray()
         self.stop = asyncio.Event()
         self.disconnect = False
         self.invalid_status = False
-        self.detector = SettleDetector()
+        self.detector = SettleDetector() if settle else None
+        self.max_duration = float(max_duration)
+        self.max_samples = int(round(self.max_duration * SAMPLE_RATE))
+        self.max_pcm_bytes = (MAX_PCM_BYTES if settle else
+                              self.max_samples * SAMPLE_WIDTH)
+        self.max_duration_reached = False
         self.settled = False
         self.settle_seconds = None
         self.settle_criterion = None
         self.discarded_packets = 0
         self.samples = 0
+        # The daemon waits on this event to report the settled phase.
+        self.settled_event = asyncio.Event()
+        self.sco_opened_at = None
+        self.settled_at = None
+        self.settle_after_sco_seconds = None
+        self.silence_used = False
+        self.silence_error = None
         # Hold only the tail that a settle decision can still reach back to.
         self.pending = deque()
         self.pending_samples = 0
@@ -357,6 +395,12 @@ class Capture:
             self.stop.set()
             return
         payload = packet.data
+        if self.detector is None:
+            self._store(payload)
+            if self.samples >= self.max_samples:
+                self.max_duration_reached = True
+                self.stop.set()
+            return
         if not self.settled:
             self._hold(payload)
             if self.detector.feed(payload):
@@ -391,14 +435,31 @@ class Capture:
                 self._store(payload)
             else:
                 self.discarded_packets += 1
+        self.settled_at = time.monotonic()
+        if self.sco_opened_at is not None:
+            self.settle_after_sco_seconds = round(
+                self.settled_at - self.sco_opened_at, 3)
+        self.settled_event.set()
 
     def _store(self, payload):
         # Keep whole 16-bit samples, so the WAV data chunk stays even.
         payload = payload[:len(payload) & ~1]
         if not payload:
             return
-        if len(self.data) + len(payload) > MAX_PCM_BYTES:
+        remaining = self.max_pcm_bytes - len(self.data)
+        if remaining <= 0:
+            if self.detector is None:
+                self.max_duration_reached = True
             self.stop.set()
+            return
+        if len(payload) > remaining:
+            if self.detector is not None:
+                self.stop.set()
+                return
+            payload = payload[:remaining & ~1]
+            self.max_duration_reached = True
+            self.stop.set()
+        if not payload:
             return
         self.data.extend(payload)
         self.samples += len(payload) // 2
@@ -497,6 +558,32 @@ async def simulate_call(ag):
     await asyncio.sleep(CALL_INDICATOR_PAUSE)
 
 
+async def send_silence(device, link, capture):
+    """Send paced silent PCM downlink packets until the capture stops.
+
+    Some handsets may start their microphone only after downlink audio arrives.
+    This mirrors tools/hfp_capture.py --send-pcm-silence. The packet length and
+    the pacing use the same 16-bit mono 8 kHz assumption as the settle detector.
+    The loop stops on capture.stop or a link error, so the capture end always
+    stops the stream.
+    """
+    size = min(link.tx_packet_length, 240) & ~1
+    if size < 2:
+        capture.silence_error = (
+            "The audio link reported an unusable downlink packet length.")
+        return
+    interval = size / (SAMPLE_RATE * SAMPLE_WIDTH)
+    silence = bytes(size)
+    while not capture.stop.is_set():
+        try:
+            device.host.send_sco_sdu(link.handle, silence)
+        except Exception:
+            capture.silence_error = (
+                "The downlink silence stream stopped on a link error.")
+            return
+        await asyncio.sleep(interval)
+
+
 async def setup_sco(device, acl, capture, links):
     """Open the eSCO voice link and attach the capture sink."""
     loop = asyncio.get_running_loop()
@@ -538,8 +625,8 @@ async def wait_for_uart_release(seconds=3.0):
     return False
 
 
-async def run_capture(keystore, address):
-    """Run one Audio Gateway session and return (pcm, settle_seconds)."""
+async def run_capture(keystore, address, send_silence=False):
+    """Run one Audio Gateway session and return a CaptureReport."""
     deadline = time.monotonic() + CAPTURE_DEADLINE_SECONDS
     capture = Capture()
     hci_transport = None
@@ -547,6 +634,7 @@ async def run_capture(keystore, address):
     acl = None
     rfcomm_client = None
     links = []
+    silence_task = None
     phase = "port"
     try:
         hci_transport = await step(
@@ -601,8 +689,14 @@ async def run_capture(keystore, address):
         await step(simulate_call(ag), deadline, CALL_TIMEOUT, phase)
 
         phase = "sco"
-        await step(setup_sco(device, acl, capture, links), deadline, SCO_TIMEOUT, phase)
+        link = await step(setup_sco(device, acl, capture, links), deadline,
+                          SCO_TIMEOUT, phase)
+        capture.sco_opened_at = time.monotonic()
         print("The audio link is open. Recording.", flush=True)
+        if send_silence:
+            capture.silence_used = True
+            silence_task = asyncio.create_task(
+                send_silence(device, link, capture))
 
         phase = "capture"
         try:
@@ -620,7 +714,13 @@ async def run_capture(keystore, address):
             raise CaptureFailure("The headset did not stream audio.")
         if not capture.data:
             raise CaptureFailure("The capture received no audio data.")
-        return bytes(capture.data), capture.settle_seconds
+        return CaptureReport(
+            pcm=bytes(capture.data),
+            settle_seconds=capture.settle_seconds,
+            settle_after_sco_seconds=capture.settle_after_sco_seconds,
+            silence_used=capture.silence_used,
+            silence_error=capture.silence_error,
+        )
     except CaptureFailure:
         raise
     except Exception as error:
@@ -631,6 +731,10 @@ async def run_capture(keystore, address):
         raise CaptureFailure(f"The {PHASE_NAMES[phase]} step failed.") from error
     finally:
         capture.stop.set()
+        if silence_task is not None:
+            silence_task.cancel()
+            await asyncio.gather(silence_task, return_exceptions=True)
+            silence_task = None
         for link in links:
             link.sink = None
             await quiet(link.disconnect)
@@ -694,7 +798,7 @@ def parse_args(argv=None):
     )
     parser.add_argument("--config", required=True, metavar="FILE",
                         help="Upload configuration with server_url and token. "
-                             "The file is deleted after it is read.")
+                             "The file is kept so later runs can reuse it.")
     parser.add_argument("--headset", type=headset_address, metavar="ADDRESS",
                         help="Headset Bluetooth address. Omit when the pairing store "
                              "holds one device.")
@@ -707,6 +811,10 @@ def parse_args(argv=None):
     parser.add_argument("--confirm-bluetooth-enabled-in-ui", required=True,
                         action="store_true",
                         help="Confirm that the Kindle UI shows Bluetooth enabled.")
+    parser.add_argument("--send-silence", action="store_true",
+                        help="Send paced silent audio to the headset during the capture. "
+                             "This may make the headset start its microphone sooner. "
+                             "The default is off.")
     return parser.parse_args(argv)
 
 
@@ -730,10 +838,10 @@ def main(argv=None):
 
     print(f"Headset: {address}", flush=True)
     print("The link key was read from the pairing store. It stays in memory.", flush=True)
+    print(f"Downlink silence: {'on' if args.send_silence else 'off'}.", flush=True)
 
     experiment = pw4_supervisor.Experiment()
-    pcm = None
-    settle_seconds = None
+    capture_report = None
     failure = None
     old_handlers = {}
     try:
@@ -745,7 +853,8 @@ def main(argv=None):
         experiment.handoff(budget=TOTAL_SECONDS + CLEANUP_RESERVE_SECONDS)
         experiment.open_uart(defer=True)
         print("The UART is free. Bumble owns the port now.", flush=True)
-        pcm, settle_seconds = asyncio.run(run_capture(keystore, address))
+        capture_report = asyncio.run(run_capture(
+            keystore, address, send_silence=args.send_silence))
     except pw4_supervisor.Interrupted as error:
         failure = str(error)
         print(f"Stopped: {error}", file=sys.stderr, flush=True)
@@ -765,14 +874,25 @@ def main(argv=None):
     if experiment.cleanup_failed:
         print("Cleanup failed. Check Bluetooth on the device.", file=sys.stderr, flush=True)
 
-    if failure is not None or pcm is None:
-        report(f"not sent. {failure or 'The capture produced no audio.'}")
+    if failure is not None or capture_report is None or not capture_report.pcm:
+        report_line = failure or 'The capture produced no audio.'
+        report(f"not sent. {report_line}")
         return 1
 
+    pcm = capture_report.pcm
     seconds = len(pcm) / (SAMPLE_RATE * SAMPLE_WIDTH)
     print(f"Recorded {seconds:.2f} seconds of audio.", flush=True)
-    if settle_seconds is not None:
-        print(f"The audio settled after {settle_seconds:.2f} seconds.", flush=True)
+    print("Downlink silence used: "
+          f"{'yes' if capture_report.silence_used else 'no'}.", flush=True)
+    if capture_report.settle_seconds is not None:
+        print(f"The audio settled after {capture_report.settle_seconds:.2f} "
+              "seconds.", flush=True)
+    if capture_report.settle_after_sco_seconds is not None:
+        print("The audio settled "
+              f"{capture_report.settle_after_sco_seconds:.2f} seconds after "
+              "the SCO link opened.", flush=True)
+    if capture_report.silence_error:
+        print(capture_report.silence_error, file=sys.stderr, flush=True)
 
     path = None
     try:

@@ -13,12 +13,8 @@ TIMEOUT_SECONDS = 30
 
 
 def _read_config(path):
-    try:
-        with open(path, "r", encoding="utf-8") as config_file:
-            text = config_file.read()
-    finally:
-        os.remove(path)
-    return text
+    with open(path, "r", encoding="utf-8") as config_file:
+        return config_file.read()
 
 
 def _write_sample(sample_file):
@@ -43,7 +39,7 @@ def main(argv=None):
     try:
         text = _read_config(argv[0])
     except Exception:
-        print("Could not read or delete the configuration file.", file=sys.stderr)
+        print("Could not read the configuration file.", file=sys.stderr)
         return 1
 
     try:
