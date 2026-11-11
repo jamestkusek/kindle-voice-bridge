@@ -25,6 +25,9 @@ hci = ["bumble==0.0.236"]
 test = [
     "pytest>=8.0,<9.0",
     "httpx>=0.27,<1.0",
+    # Runs the KOReader Lua spec (tests/koreader/voicebridge_spec.lua).
+    # The suite skips that test when lupa is not installed.
+    "lupa>=2.0,<3.0",
 ]
 
 [project.urls]
