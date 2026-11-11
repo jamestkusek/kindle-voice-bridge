@@ -19,10 +19,8 @@ back — with a tap and a spoken sentence instead of a paragraph of typing?
 
 ## Who it's for
 
-Primarily me: a heavy Kindle reader who wants low-friction, in-context
-explanations while reading. More broadly, anyone using KOReader's LLM features
-who would rather talk than type, and readers for whom a slow on-screen keyboard
-is a real barrier rather than an annoyance.
+Primarily me: a heavy Kindle reader who wants low-friction explanations while reading. More broadly, anyone using KOReader's LLM features
+who would rather talk than type using the keyboard.
 
 ## What I built
 
@@ -68,19 +66,19 @@ without the current page or chapter as context.
 
 ## What I'd do next
 
-1. **Add reading context.** Send the current page, chapter and book title with
-   the question, so answers can use the passage the reader is looking at.
-2. **Remove the laptop.** Move the receiver to a hosted HTTPS service, or push
-   capture and ASR onto the device, so normal use doesn't need a PC awake.
-3. **Make it a tap, not an experiment.** A single start/stop control in the
-   reader, visible status, and no manual key export or relay setup.
-4. **Harden the audio path.** Confirm the real codec and sample rate, try
-   wideband mSBC for better transcription, and cut the startup artifact and
-   latency.
-5. **Test the risky assumptions.** Measure SCO packet loss while uploading,
-   battery cost, and recovery when a run crashes mid-handoff.
-6. **Broaden support.** More headsets, more Kindle models and firmware, and an
-   authenticated, encrypted relay.
+1. **Add reading context.** This is the most important one for me.
+Send the current page, chapter and book title with
+   the question, so answers can use the passage the reader is looking at. I also want to
+complement this server side with a knowledge graph that builds up as the user asks queries, so
+the system learns what style of response the user likes, and what they already know. Furthermore,
+the knowledge graph can also capture all the books the user asks questions about, so it can easily
+look them up for accurate answers.
+
+2. **Remove the laptop.** Move the receiver to a hosted HTTPS service, so we can configure a simple URL/IP address to send queries to.
+3. **Improve the UI ** A single button to press to talk, which detects when you have finished your question, automatic pop-up of response,
+ would all reduce friction in the user flow.
+4. **Broaden support.** Make this system OS-agnostic, so you can run it on
+Linux or Windows. Add support for more Kindle models and more types of bluetooth headsets.
 
 ## Status
 
