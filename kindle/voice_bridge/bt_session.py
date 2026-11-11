@@ -65,6 +65,7 @@ unusable.
 
 import argparse
 import asyncio
+import json
 import os
 import re
 import signal
@@ -73,6 +74,8 @@ import stat
 import struct
 import sys
 import time
+import urllib.error
+import urllib.request
 
 try:
     import fcntl
@@ -84,6 +87,11 @@ SOCKET_PATH = "/tmp/voicebridge-bt-session.sock"
 STATE_PATH = "/tmp/voicebridge-bt-session.state"
 COMMAND_PATH = "/tmp/voicebridge-bt-session.cmd"
 STATE_INTERVAL_SECONDS = 0.1
+# The receiver answers a question after it transcribes it. The daemon polls for
+# that answer and publishes it in the state file.
+ANSWER_POLL_SECONDS = 1.0
+ANSWER_TIMEOUT_SECONDS = 60.0
+ANSWER_REQUEST_TIMEOUT = 10.0
 CONTROL_TIMEOUT = 5.0
 CONTROL_LINE_LIMIT = 1024
 RECORD_CLIENT_TIMEOUT = 200.0
@@ -264,6 +272,9 @@ class Session:
         self.command_path = command_path
         self.state_task = None
         self.link_task = None
+        self.answer_task = None
+        self.last_answer = None
+        self.last_recording_id = None
         self.heartbeat = 0
         self.recording_started_at = None
         self.capture_limit = None
@@ -333,6 +344,48 @@ class Session:
         remaining = max(0.0, self.capture_limit - elapsed)
         return int(round(elapsed * 1000.0)), int(round(remaining * 1000.0))
 
+    def start_answer_poll(self, recording_id):
+        """Start polling the receiver for the answer to one recording."""
+        if self.answer_task is not None:
+            self.answer_task.cancel()
+            self.answer_task = None
+        self.answer_task = asyncio.create_task(self.fetch_answer(recording_id))
+
+    def _get_answer(self, url):
+        request = urllib.request.Request(
+            url, headers={"Authorization": f"Bearer {self.config['token']}"})
+        with urllib.request.urlopen(
+                request, timeout=ANSWER_REQUEST_TIMEOUT) as response:
+            return json.loads(response.read())
+
+    async def fetch_answer(self, recording_id):
+        """Poll the receiver until the answer is ready, then publish it."""
+        base = self.config["server_url"].rstrip("/")
+        url = f"{base}/v1/recordings/{recording_id}/answer"
+        deadline = time.monotonic() + ANSWER_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                payload = await asyncio.to_thread(self._get_answer, url)
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                status = payload.get("status")
+                if status == "ready":
+                    text = payload.get("text")
+                    if isinstance(text, str) and text.strip():
+                        self.last_answer = text.strip()
+                        self.write_state_file()
+                    return
+                if status == "failed":
+                    return
+            await asyncio.sleep(ANSWER_POLL_SECONDS)
+
+    def answer_body(self):
+        """Return the answer line for the state file."""
+        if not self.last_answer:
+            return "-"
+        return safe_text(self.last_answer, 400).replace("\n", " ")
+
     def state_body(self):
         """Return one machine-readable state line without the ok prefix.
 
@@ -359,7 +412,8 @@ class Session:
         if not self.state_path:
             return
         self.heartbeat = (self.heartbeat + 1) % 1000000
-        line = f"v1 {self.heartbeat} {self.state_body()}\n"
+        line = (f"v1 {self.heartbeat} {self.state_body()}\n"
+                f"answer {self.answer_body()}\n")
         temporary = self.state_path + ".tmp"
         try:
             with open(temporary, "w", encoding="ascii", errors="replace") as target:
@@ -501,6 +555,8 @@ class Session:
             self.record_kind = "manual"
             self.manual_stop_event = stop_requested
             self.last_record_result = None
+            self.last_answer = None
+            self.last_recording_id = None
             self.set_phase("preparing")
             task = asyncio.create_task(
                 self._manual_recording(ready, stop_requested))
@@ -652,6 +708,8 @@ class Session:
             reply = await self._upload_pcm(
                 pcm, settle_seconds, settle_after_sco, silence_used, silence_error,
                 max_duration_reached=max_duration_reached)
+            if self.last_recording_id:
+                self.start_answer_poll(self.last_recording_id)
         except self.capture_local.CaptureFailure as error:
             message = safe_text(str(error))
             if max_duration_reached:
@@ -725,6 +783,9 @@ class Session:
                 os.remove(path)
             except OSError:
                 pass
+        recording_id = result.get("id") if isinstance(result, dict) else None
+        if isinstance(recording_id, str) and recording_id:
+            self.last_recording_id = recording_id
         return self.format_result(
             result, len(pcm), settle_seconds,
             max_duration_reached=max_duration_reached)
@@ -834,6 +895,10 @@ class Session:
                         self.state_task.cancel()
                         await asyncio.gather(self.state_task, return_exceptions=True)
                         self.state_task = None
+                    if self.answer_task is not None:
+                        self.answer_task.cancel()
+                        await asyncio.gather(self.answer_task, return_exceptions=True)
+                        self.answer_task = None
                     if self.link_task is not None:
                         self.link_task.cancel()
                         await asyncio.gather(self.link_task, return_exceptions=True)

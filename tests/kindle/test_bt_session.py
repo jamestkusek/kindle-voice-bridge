@@ -577,12 +577,12 @@ def test_state_file_is_written_and_removed(tmp_path):
     path = tmp_path / "session.state"
 
     session.write_state_file()
-    first = path.read_text(encoding="ascii")
+    first = path.read_text(encoding="ascii").splitlines()[0]
     session.write_state_file()
-    second = path.read_text(encoding="ascii")
+    second = path.read_text(encoding="ascii").splitlines()[0]
 
-    first_fields = first.rstrip("\n").split(" ", 6)
-    second_fields = second.rstrip("\n").split(" ", 6)
+    first_fields = first.split(" ", 6)
+    second_fields = second.split(" ", 6)
     assert first_fields[0] == "v1"
     assert first_fields[2:] == ["idle", "-1", "-1", "starting", "-"]
     assert int(second_fields[1]) == int(first_fields[1]) + 1
@@ -600,7 +600,7 @@ def test_state_file_carries_the_last_result(tmp_path):
     session.last_record_result = "ok sent rec_1 5.00s"
     session.write_state_file()
 
-    fields = path.read_text(encoding="ascii").rstrip("\n").split(" ", 6)
+    fields = path.read_text(encoding="ascii").splitlines()[0].split(" ", 6)
     assert fields[2:] == ["idle", "-1", "-1", "starting", "ok sent rec_1 5.00s"]
 
 
@@ -657,3 +657,58 @@ def test_a_missing_command_file_is_harmless(tmp_path):
     session.poll_command_file()
 
     assert not (tmp_path / "session.cmd").exists()
+
+
+def test_fetch_answer_publishes_a_ready_answer(tmp_path, monkeypatch):
+    monkeypatch.setattr(bt_session, "ANSWER_POLL_SECONDS", 0.01)
+    controller = FakeController()
+    session, capture_local, uploader, experiment = build_session(tmp_path, controller)
+    replies = [{"status": "pending"}, {"status": "ready", "text": "  It is a cloud.  "}]
+    session._get_answer = lambda url: replies.pop(0)
+
+    asyncio.run(session.fetch_answer("rec_test"))
+
+    assert session.last_answer == "It is a cloud."
+    state = (tmp_path / "session.state").read_text(encoding="ascii")
+    assert "answer It is a cloud." in state
+
+
+def test_fetch_answer_stops_on_a_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(bt_session, "ANSWER_POLL_SECONDS", 0.01)
+    controller = FakeController()
+    session, capture_local, uploader, experiment = build_session(tmp_path, controller)
+    session._get_answer = lambda url: {"status": "failed", "error": "no answer"}
+
+    asyncio.run(session.fetch_answer("rec_test"))
+
+    assert session.last_answer is None
+
+
+def test_fetch_answer_survives_a_network_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(bt_session, "ANSWER_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(bt_session, "ANSWER_TIMEOUT_SECONDS", 0.05)
+    controller = FakeController()
+    session, capture_local, uploader, experiment = build_session(tmp_path, controller)
+
+    def boom(url):
+        raise OSError("connection refused")
+
+    session._get_answer = boom
+
+    asyncio.run(session.fetch_answer("rec_test"))
+
+    assert session.last_answer is None
+
+
+def test_the_state_file_has_an_answer_line(tmp_path):
+    controller = FakeController()
+    session, capture_local, uploader, experiment = build_session(tmp_path, controller)
+
+    session.write_state_file()
+    lines = (tmp_path / "session.state").read_text(encoding="ascii").splitlines()
+    assert lines[1] == "answer -"
+
+    session.last_answer = "A short answer."
+    session.write_state_file()
+    lines = (tmp_path / "session.state").read_text(encoding="ascii").splitlines()
+    assert lines[1] == "answer A short answer."
