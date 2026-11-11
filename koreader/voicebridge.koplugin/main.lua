@@ -1411,7 +1411,7 @@ function VoiceBridge:confirmStartBluetoothSession()
         return
     end
     UIManager:show(ConfirmBox:new{
-        text = _("This action starts a Bluetooth session. The session stops stock Bluetooth once. It keeps the Bluetooth controller for up to 10 minutes after the last recording. A crash can leave Bluetooth unusable. The session reads /mnt/us/kindle-voice-bridge/upload.json and keeps it for later sessions. Stop the HCI probe before you start a session. Start the session?"),
+        text = _("This action starts a Bluetooth session. The session stops stock Bluetooth once. It keeps the Bluetooth controller for up to 30 minutes after the last recording. A crash can leave Bluetooth unusable. The session reads /mnt/us/kindle-voice-bridge/upload.json and keeps it for later sessions. Stop the HCI probe before you start a session. Start the session?"),
         ok_text = _("Start"),
         ok_callback = function() self:startBluetoothSession() end,
     })
