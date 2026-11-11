@@ -263,6 +263,7 @@ class Session:
         self.state_path = state_path
         self.command_path = command_path
         self.state_task = None
+        self.link_task = None
         self.heartbeat = 0
         self.recording_started_at = None
         self.capture_limit = None
@@ -381,6 +382,22 @@ class Session:
             os.unlink(self.state_path)
         except OSError:
             pass
+
+    def start_link_probe(self):
+        """Start the Wi-Fi probe when link-test.json is present, else do nothing."""
+        try:
+            from link_probe import hold_link, load_config
+        except ImportError:
+            try:
+                from .link_probe import hold_link, load_config
+            except ImportError:
+                return None
+        settings = load_config()
+        if settings is None:
+            return None
+        print(f"Link probe: {settings['host']}:{settings['port']} for "
+              f"{settings['seconds']:g} s.", flush=True)
+        return asyncio.create_task(hold_link(**settings))
 
     def poll_command_file(self):
         """Apply one queued command from the plugin.
@@ -806,6 +823,7 @@ class Session:
                 self.last_activity = time.monotonic()
                 self.watchdog = asyncio.create_task(self.idle_watchdog())
                 self.state_task = asyncio.create_task(self.state_loop())
+                self.link_task = self.start_link_probe()
                 try:
                     await self.stop_event.wait()
                 finally:
@@ -816,6 +834,10 @@ class Session:
                         self.state_task.cancel()
                         await asyncio.gather(self.state_task, return_exceptions=True)
                         self.state_task = None
+                    if self.link_task is not None:
+                        self.link_task.cancel()
+                        await asyncio.gather(self.link_task, return_exceptions=True)
+                        self.link_task = None
                     self.remove_state_file()
                     self.remove_command_file()
             finally:
