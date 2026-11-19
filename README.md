@@ -4,7 +4,6 @@ Ask an LLM a question out loud while reading on a Kindle.
 
 [![tests](https://github.com/jamestkusek/kindle-voice-bridge/actions/workflows/tests.yml/badge.svg)](https://github.com/jamestkusek/kindle-voice-bridge/actions/workflows/tests.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](pyproject.toml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ## Why
 
