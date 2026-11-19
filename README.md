@@ -69,29 +69,29 @@ Basically, the Capture Supervisor takes over the Bluetooth chip on the Kindle, o
 
 ### Preliminary: Install the runtimes on the Kindle
 
-This is a one-time step. It lets the Kindle run the code that captures audio
-from the Bluetooth headset and sends it to the server.
+This is a one-time step. The Kindle has no system Python, so it needs a portable
+runtime and the Bumble Bluetooth stack.
 
-Connect the Kindle to your PC over USB, then copy these two directories as
-described below. Create the directories if they aren't present yet.
+1. Stage the two bundles on the host:
+   - `build/python31117/` — portable CPython 3.11.17 (ARMv7, glibc 2.20).
+   - `build/bumble-kindle/` — Bumble 0.0.236 and its pure-Python dependencies.
+   The exact package versions are pinned in
+   [docs/bumble-bundle-manifest.txt](docs/bumble-bundle-manifest.txt).
+2. Connect the Kindle over USB and run:
 
-| What | Where on the Kindle |
-|---|---|
-| Portable CPython 3.11.17 (ARMv7, glibc 2.20) | `/mnt/us/kindle-voice-bridge/python31117/` |
-| Bumble 0.0.236 and its pure-Python dependencies | `/mnt/us/kindle-voice-bridge/bumble/` |
+   ```powershell
+   .\tools\kvb.ps1 install-runtimes -KindleRoot D:\
+   ```
 
-Before the first session, pair the headset in the Kindle's Bluetooth settings
-and enable Bluetooth. The daemon reads the headset link key from the pairing
-store, so it cannot connect to an unpaired headset. Put the Kindle on the same
-Wi-Fi network as the laptop.
+   The command checks both bundles, verifies the Bumble bundle, and copies them
+   to `/mnt/us/kindle-voice-bridge/`. It skips runtimes that are already
+   installed. Use `-Force` to replace them, or `-BundleRoot` if the bundles are
+   not under `build\`.
+3. Pair the headset in the Kindle's Bluetooth settings and enable Bluetooth.
+   Put the Kindle on the same Wi-Fi network as the laptop.
 
-The exact wheel set and versions are pinned in
-[docs/bumble-bundle-manifest.txt](docs/bumble-bundle-manifest.txt). Check a
-staged bundle on the computer with:
-
-```powershell
-python tools/verify_bumble_bundle.py --bundle build/bumble-kindle
-```
+The command copies the staged bundles. It does not download them. The `deploy`
+command copies the application files only; it does not copy either runtime.
 
 ### 1. Jailbreak the Kindle and install KOReader
 
@@ -113,8 +113,9 @@ python -m pip install -e .
 .\tools\kvb.ps1 receiver
 ```
 
-The health check is at `http://127.0.0.1:18767/healthz`. The dashboard at
-`http://127.0.0.1:18767/` shows each recording, its transcript and its answer.
+The receiver listens on port 18767. On this computer, the dashboard is at
+`http://127.0.0.1:18767/`; its health check is at `/healthz`. The dashboard
+shows each recording, its transcript and its answer.
 
 The server stores recordings in `%LOCALAPPDATA%\KindleVoiceBridge\recordings`.
 Transcription and answering switch on when
@@ -123,7 +124,8 @@ OpenRouter API key in that file on a single line, with no quotes. The file is
 gitignored. Without it the receiver still accepts uploads, but it does not
 transcribe or answer them.
 
-Add `-LocalOnly` to bind `127.0.0.1` only. Stop or restart the receiver with:
+Add `-LocalOnly` to bind the receiver to this computer only. Stop or restart
+the receiver with:
 
 ```powershell
 .\tools\kvb.ps1 stop
@@ -169,8 +171,8 @@ by hand.
 8. When you are finished, select **Stop Bluetooth session** to restore stock
    Bluetooth.
 
-The dashboard at `http://127.0.0.1:18767/` shows the recording, its transcript
-and the answer, and updates live as new ones arrive.
+The dashboard shows the recording, its transcript and the answer, and updates
+live as new ones arrive.
 
 ## Tests
 
