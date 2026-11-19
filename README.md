@@ -201,6 +201,3 @@ python -m pip install -e ".[test]"
 - [docs/review-ui.md](docs/review-ui.md): the dashboard and its endpoints.
 - [docs/recovery.md](docs/recovery.md): the Bluetooth recovery commands.
 - [ai.md](ai.md): how AI was used to build the project.
-- [agent-plan.md](agent-plan.md): the coordinator brief that split the work
-  between the two models.
-- [PLAN.md](PLAN.md): the original project plan and the hardware precautions.
