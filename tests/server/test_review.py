@@ -14,6 +14,7 @@ import pathlib
 import pytest
 from fastapi.testclient import TestClient
 
+from voice_bridge_server import review as review_module
 from voice_bridge_server.app import create_app
 from voice_bridge_server.config import Settings
 from voice_bridge_server.storage import new_recording_id
@@ -200,6 +201,39 @@ def test_delete_removes_file_and_updates_listing(
         item["id"]
         for item in client.get("/api/recordings").json()["recordings"]
     ] == [keep_id]
+
+
+def test_a_busy_sidecar_is_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(review_module.time, "sleep", lambda _seconds: None)
+
+    class Busy:
+        calls = 0
+
+        def unlink(self) -> None:
+            self.calls += 1
+            if self.calls < 3:
+                raise PermissionError("busy")
+
+    busy = Busy()
+    review_module._unlink_with_retry(busy)
+    assert busy.calls == 3
+
+
+def test_a_permanently_busy_sidecar_is_not_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(review_module.time, "sleep", lambda _seconds: None)
+
+    class Busy:
+        calls = 0
+
+        def unlink(self) -> None:
+            self.calls += 1
+            raise PermissionError("busy")
+
+    busy = Busy()
+    review_module._unlink_with_retry(busy)
+    assert busy.calls == 10
 
 
 def test_delete_unknown_or_malformed_id_is_rejected(

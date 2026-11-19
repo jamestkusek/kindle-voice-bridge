@@ -1,4 +1,5 @@
 import argparse
+import base64
 import http.client
 import ipaddress
 import json
@@ -12,6 +13,8 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 
 DEFAULT_TIMEOUT = 30
 MAX_RESPONSE_BYTES = 65536
+MAX_CONTEXT_BYTES = 4096
+CONTEXT_HEADER = "X-KVB-Context"
 
 
 class UploadError(Exception):
@@ -112,6 +115,37 @@ def _parse_response(response):
         return None
 
 
+def _read_context(context_path):
+    """Return the raw context bytes, or None when there is no readable input.
+
+    context_path is a file path or the bytes a caller already read. A missing
+    or unreadable file yields None, so the upload proceeds without a context
+    header.
+    """
+    if context_path is None:
+        return None
+    if isinstance(context_path, (bytes, bytearray)):
+        return bytes(context_path)
+    try:
+        with open(context_path, "rb") as source:
+            return source.read()
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def encode_context(raw):
+    """Return the base64url header value for the context bytes.
+
+    The value has no padding. An encoded value over 4096 bytes is rejected
+    before any request is made.
+    """
+    encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    if len(encoded) > MAX_CONTEXT_BYTES:
+        raise UploadError(
+            "The reading context is larger than {} bytes".format(MAX_CONTEXT_BYTES))
+    return encoded
+
+
 def _server_error(status, payload):
     code = None
     if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
@@ -123,7 +157,12 @@ def _server_error(status, payload):
 
 
 def upload_recording(path, base_url, token, timeout=DEFAULT_TIMEOUT,
-                     allow_insecure_lan=False):
+                     allow_insecure_lan=False, context_path=None):
+    """Upload one WAV recording with an optional reading context header.
+
+    The body and Content-Length are unchanged by the context, so a request
+    without context_path is byte-identical to the previous one.
+    """
     if (not isinstance(token, str) or not token or
             any(ord(c) < 33 or ord(c) > 126 for c in token)):
         raise UploadError("Bearer token must be non-empty printable ASCII without spaces")
@@ -139,13 +178,17 @@ def upload_recording(path, base_url, token, timeout=DEFAULT_TIMEOUT,
     except (OSError, ValueError, TypeError):
         raise UploadError("Could not read the sample file")
     _validate_wav(body)
+    headers = {
+        "Authorization": "Bearer " + token,
+        "Content-Type": "audio/wav",
+        "Accept": "application/json",
+        "Content-Length": str(len(body)),
+    }
+    context = _read_context(context_path)
+    if context is not None:
+        headers[CONTEXT_HEADER] = encode_context(context)
     try:
-        request = Request(url, data=body, headers={
-            "Authorization": "Bearer " + token,
-            "Content-Type": "audio/wav",
-            "Accept": "application/json",
-            "Content-Length": str(len(body)),
-        }, method="POST")
+        request = Request(url, data=body, headers=headers, method="POST")
         opener = build_opener(ProxyHandler({}), _NoRedirect())
         try:
             response = opener.open(request, timeout=timeout)

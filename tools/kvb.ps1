@@ -43,7 +43,11 @@ param(
 
     [switch]$LocalOnly,
 
-    [switch]$Force
+    [switch]$Force,
+
+    [string]$BundleRoot = 'build',
+
+    [switch]$SkipVerify
 )
 
 $ErrorActionPreference = 'Stop'
@@ -67,6 +71,7 @@ Usage:
   tools\kvb.ps1 restart   [-Port N] [-LocalOnly] [-Python PATH]
   tools\kvb.ps1 transcriber [-Python PATH]
   tools\kvb.ps1 deploy    [-KindleRoot D:\] [-ServerUrl URL] [-Force]
+  tools\kvb.ps1 install-runtimes [-KindleRoot D:\] [-BundleRoot PATH] [-Force] [-SkipVerify]
   tools\kvb.ps1 test      [-Python PATH]
   tools\kvb.ps1 help
 
@@ -76,6 +81,7 @@ Commands:
   restart      Stop the receiver, then start it again.
   transcriber  Start the OpenRouter transcription worker in the background.
   deploy       Copy the device files to a mounted Kindle.
+  install-runtimes  Copy CPython and Bumble to a mounted Kindle once.
   test         Run the test suite with pytest.
   help         Print this text and exit.
 
@@ -85,7 +91,9 @@ Options:
   -Python PATH     Interpreter to use. The default is .venv, then python.
   -KindleRoot D:\  Mount point of the Kindle USB storage.
   -ServerUrl URL   Write upload.json on the Kindle with this server URL.
-  -Force           Replace an existing upload.json.
+  -Force           Replace existing files.
+  -BundleRoot PATH Folder that holds python31117 and bumble-kindle. Default: build.
+  -SkipVerify      Do not run tools\verify_bumble_bundle.py.
 
 The receiver reads the token from .data\receiver-config.json. When that
 file is absent, the receiver reads the token from the Kindle upload.json.
@@ -437,8 +445,102 @@ function Invoke-Deploy {
         Write-Output 'upload.json is missing. Run deploy with -ServerUrl http://<laptop-ip>:<port> to write it.'
     }
 
-    Write-Output 'the Python runtime and the Bumble bundle are not copied. They stay at /mnt/us/kindle-voice-bridge/.'
+    Write-Output 'the Python runtime and the Bumble bundle are not copied. Run install-runtimes once.'
     Write-WarningLine 'the device files perform a Bluetooth handoff. The handoff stops the stock Bluetooth daemon and can leave Bluetooth unusable. Recovery is not guaranteed.'
+}
+
+function Invoke-InstallRuntimes {
+    if (-not (Test-Path -LiteralPath $KindleRoot)) {
+        throw "Kindle root not found: $KindleRoot. Connect the USB cable and pass -KindleRoot."
+    }
+
+    $rootPath = (Resolve-Path -LiteralPath $KindleRoot).Path
+    if ($rootPath.TrimEnd('\') -eq $ProjectRoot.TrimEnd('\')) {
+        throw "The Kindle root is the project directory. Pass the USB mount point."
+    }
+
+    $bundlePath = $BundleRoot
+    if (-not [System.IO.Path]::IsPathRooted($bundlePath)) {
+        $bundlePath = Join-Path $ProjectRoot $bundlePath
+    }
+    if (-not (Test-Path -LiteralPath $bundlePath)) {
+        throw "Bundle folder not found: $bundlePath. Put python31117 and bumble-kindle there, or pass -BundleRoot."
+    }
+    $bundlePath = (Resolve-Path -LiteralPath $bundlePath).Path
+
+    $bundles = @(
+        [pscustomobject]@{
+            Name = 'CPython 3.11.17'
+            Source = Join-Path $bundlePath 'python31117'
+            Target = 'python31117'
+            Probe = 'bin\python3.11'
+        },
+        [pscustomobject]@{
+            Name = 'Bumble 0.0.236'
+            Source = Join-Path $bundlePath 'bumble-kindle'
+            Target = 'bumble'
+            Probe = 'bumble\__init__.py'
+        }
+    )
+
+    foreach ($bundle in $bundles) {
+        if (-not (Test-Path -LiteralPath $bundle.Source)) {
+            throw "Missing bundle: $($bundle.Source)."
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $bundle.Source $bundle.Probe))) {
+            throw "The bundle at $($bundle.Source) does not look like $($bundle.Name). Expected $($bundle.Probe)."
+        }
+    }
+
+    if (-not $SkipVerify) {
+        $python = Resolve-Python 'sys'
+        $verifier = Join-Path $ProjectRoot 'tools\verify_bumble_bundle.py'
+        $bumbleSource = Join-Path $bundlePath 'bumble-kindle'
+        $oldPythonPath = $env:PYTHONPATH
+        $env:PYTHONPATH = $bumbleSource
+        try {
+            & $python $verifier --bundle $bumbleSource
+            if ($LASTEXITCODE -ne 0) {
+                throw 'The Bumble bundle failed verification. Use -SkipVerify only if you trust the bundle.'
+            }
+        } finally {
+            if ([string]::IsNullOrEmpty($oldPythonPath)) {
+                Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+            } else {
+                $env:PYTHONPATH = $oldPythonPath
+            }
+        }
+    }
+
+    $deviceDir = Join-Path $rootPath 'kindle-voice-bridge'
+    New-Item -ItemType Directory -Force -Path $deviceDir | Out-Null
+
+    foreach ($bundle in $bundles) {
+        $target = Join-Path $deviceDir $bundle.Target
+        $probe = Join-Path $target $bundle.Probe
+        if ((Test-Path -LiteralPath $probe) -and (-not $Force)) {
+            Write-Output "$($bundle.Name) is already present at $target. Use -Force to replace it."
+            continue
+        }
+        Write-Output "copying $($bundle.Name) to $target"
+        & robocopy $bundle.Source $target /E /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null
+        $code = $LASTEXITCODE
+        if ($code -ge 8) {
+            throw "robocopy failed for $($bundle.Name) with exit code $code."
+        }
+        if (-not (Test-Path -LiteralPath $probe)) {
+            throw "Copy finished, but $probe is missing."
+        }
+        $size = (Get-ChildItem -LiteralPath $target -Recurse -File | Measure-Object -Property Length -Sum).Sum
+        if ($null -eq $size) {
+            $size = 0
+        }
+        $mb = [math]::Round($size / 1MB, 1)
+        Write-Output "installed $($bundle.Name) ($mb MB)"
+    }
+
+    Write-Output "runtimes are at $deviceDir"
+    Write-Output 'next: run tools\kvb.ps1 deploy -KindleRoot <mount> -ServerUrl <url>'
 }
 
 function Invoke-Tests {
@@ -464,6 +566,7 @@ switch ($Command.ToLowerInvariant()) {
     'restart' { Restart-Receiver }
     'transcriber' { Start-Transcriber }
     'deploy' { Invoke-Deploy }
+    'install-runtimes' { Invoke-InstallRuntimes }
     'test' { Invoke-Tests }
     'help' { Show-Usage }
     default {

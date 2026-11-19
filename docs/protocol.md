@@ -4,13 +4,19 @@ Contract for milestone 1: one authenticated upload endpoint, one receiver
 implementation, one client contract used both on the local network and (later)
 on a hosted server.
 
-- **Revision:** 1 (first milestone). This file is the single source of truth for
-  the wire contract and the Python-facing receiver interfaces.
+- **Revision:** 3. This file is the single source of truth for the upload wire
+  contract and the Python-facing receiver interfaces. It covers the upload
+  endpoint, the optional reading context header and the authenticated answer
+  read. The receiver has since gained transcription, a review dashboard and
+  deletion routes, a debug dashboard, a dev ask and a library sync; those are
+  documented in [transcription.md](transcription.md),
+  [review-ui.md](review-ui.md) and [context-and-library.md](context-and-library.md)
+  and sit outside this contract where the tables below say so.
 - **Receiver:** `server/voice_bridge_server/` (FastAPI + uvicorn, pure Python).
 - **Client:** `kindle/voice_bridge/` uploader (implementation owned by another
   workstream; obligations in [§13](#13-client-kindle-uploader-obligations)).
-- **Scope:** receive, validate, store, acknowledge. No transcription, no
-  playback API, no deletion API, no streaming, no retries, no cloud provider.
+- **Scope:** receive, validate, store, acknowledge, and serve the authenticated
+  answer read. No streaming, no retries, no idempotency key.
 
 ### Provisional and unverified
 
@@ -36,8 +42,8 @@ prove intelligibility, correct routing or headset compatibility.
 
 | Item | Value |
 |---|---|
-| Base URL (local) | `http://127.0.0.1:8000` (loopback default) |
-| Base URL (LAN) | `http://<laptop-lan-ip>:8000` — only with explicit user approval |
+| Base URL (local) | `http://127.0.0.1:18767` (loopback default) |
+| Base URL (LAN) | `http://<laptop-lan-ip>:18767` — only with explicit user approval |
 | Base URL (remote) | `https://<host>` — verified TLS required |
 | Upload | `POST /v1/recordings` |
 | Health | `GET /healthz` (no auth) |
@@ -47,8 +53,9 @@ prove intelligibility, correct routing or headset compatibility.
 | Max duration | 15.0 s (configurable) |
 | Success | `201 Created` + JSON, only after the clip is stored |
 | Retries | None. One attempt per recording. No idempotency key in v1. |
-| Read/delete API | None in v1 (filesystem only) |
-| Retention | Laptop: **approved** — stored clips stay until manually deleted; incomplete files are cleaned after a failed write. Device (Kindle): **pending** — see [§9](#9-storage-and-retention--laptop-approved-device-pending) |
+| Reading context | Optional `X-KVB-Context` header on the upload ([§4.1.1](#411-x-kvb-context)). A missing, malformed or oversized header never changes the status. |
+| Read API | `GET /v1/recordings/{id}/answer` with the bearer token. `POST /v1/dev/ask` is an authenticated development endpoint ([§4.4](#44-post-v1devask)). The review and debug dashboards add unauthenticated routes ([review-ui.md](review-ui.md)). |
+| Retention | Laptop: **approved** — stored clips stay until manually deleted; incomplete files are cleaned after a failed write. Device (Kindle): **implemented, pending formal approval** — see [§9](#9-storage-and-retention) |
 
 ---
 
@@ -62,16 +69,18 @@ prove intelligibility, correct routing or headset compatibility.
 2. Every accepted upload gets a **server-generated opaque ID**. The client never
    supplies an ID, filename or timestamp that affects storage.
 3. The receiver never logs the request body, the token, the `Authorization`
-   header or the audio content.
+   header, the audio content or the reading context payload
+   ([§10](#10-logging-and-secret-hygiene)).
 4. The receiver never retries, never re-uploads and never contacts the client.
 5. The same path, headers, body format, status codes and JSON schemas are used
    locally and remotely. Only the base URL, the transport security and the token
    differ ([§11](#11-transport-security-and-deployment-modes)).
 
-**Non-goals for v1:** streaming or chunked *semantic* uploads, resumable uploads,
-transcription, playback/download endpoints, listing endpoints, deletion
-endpoints, multi-user accounts, per-user quotas, idempotency keys, webhooks,
-browser/CORS clients, compression.
+**Non-goals for this contract:** streaming or chunked *semantic* uploads,
+resumable uploads, multi-user accounts, per-user quotas, idempotency keys,
+webhooks, browser/CORS clients, compression. Transcription, the answer read and
+the review routes exist but are documented in [transcription.md](transcription.md)
+and [review-ui.md](review-ui.md).
 
 ---
 
@@ -79,7 +88,7 @@ browser/CORS clients, compression.
 
 - HTTP/1.1 or later over TCP. Plain HTTP is permitted **only** on loopback, or on
   a trusted LAN with explicit user approval ([§11](#11-transport-security-and-deployment-modes)).
-- Default bind: `127.0.0.1:8000`. The bind address and port are **not** part of
+- Default bind: `127.0.0.1:18767`. The bind address and port are **not** part of
   `Settings`; they are supplied to uvicorn (`--host`, `--port`).
 - For LAN access, bind the **specific** LAN address (e.g. `--host 192.168.1.50`),
   not `0.0.0.0`, so the service is not accidentally reachable on other
@@ -112,8 +121,9 @@ Registers one completed recording.
 | `Content-Length` | recommended | If present and greater than `max_body_bytes`, the request is rejected with `413` **without reading the body**. |
 | `Transfer-Encoding: chunked` | allowed | Used when `Content-Length` is absent. The cap is enforced while streaming ([§6](#6-request-body-handling)). |
 | `Content-Encoding` | must be absent or `identity` | Any other value (`gzip`, `deflate`, `br`, ...) is rejected with `415`. The body is never decompressed. |
+| `X-KVB-Context` | no | Optional reading context: base64url (no padding) of UTF-8 JSON, at most 4096 bytes decoded. A missing header leaves the messages and the model unchanged. A malformed or oversized header never rejects the upload ([§4.1.1](#411-x-kvb-context)). |
 | `Accept` | ignored | Response is always `application/json`. |
-| Any other header | ignored | Including `X-*` headers, `User-Agent`, client-supplied filenames. No header other than the four above changes behaviour. |
+| Any other header | ignored | Including `User-Agent` and client-supplied filenames. No header other than the five above changes behaviour. |
 
 **Request body:** the complete WAV file, byte-for-byte, with no wrapper,
 encoding, base64 or multipart envelope. Zero-length bodies are rejected.
@@ -126,6 +136,63 @@ the same handler **without an HTTP redirect**, so clients never have to replay a
 POST body.
 
 **Success:** `201 Created`, JSON body in [§8.1](#81-success-201).
+
+#### 4.1.1 `X-KVB-Context`
+
+The header is the only client-supplied book data in the contract. It carries a
+pointer to a reading position, not page text.
+
+```
+X-KVB-Context: base64url(no padding) of UTF-8 JSON, at most 4096 bytes decoded
+```
+
+Payload, schema version 1:
+
+```json
+{
+  "v": 1,
+  "book": {"title": "", "authors": [""], "size_bytes": 0, "partial_md5": "", "format": "epub"},
+  "pos": {"page": 142, "total_pages": 310, "fraction": 0.43, "chapter": ""},
+  "locator": {"xpointer": "", "href": ""},
+  "highlight": "text or null"
+}
+```
+
+| Field | Type | Rule |
+|---|---|---|
+| `v` | int | Must be `1`. Any other value is `bad_shape`. |
+| `book` | object | Optional section: `title`, `authors` (list of strings), `size_bytes`, `partial_md5`, `format`. Only these fields are read. |
+| `pos` | object | Optional section: `page`, `total_pages`, `fraction`, `chapter`. Only these fields are read. |
+| `locator` | object | Optional section: `xpointer`, `href`. Recorded, not resolved. |
+| `highlight` | string or null | Selected text when the ask starts from a highlight. |
+
+A section that is present must be a JSON object; a missing section is allowed.
+Unknown fields inside a section are ignored.
+
+Rules:
+
+1. The header is read after authentication and before the body checks. It
+   cannot change the status, the body or the response fields.
+2. A missing or empty header means no context. The messages, the model and the
+   stored files are the ones a context-free upload produces.
+3. A rejected header is recorded with one reason and the upload continues: the
+   audio is stored, the `context` stage has `outcome: "rejected"`, and the
+   answer uses the transcript alone.
+4. The decoded payload is written to `<storage_dir>/<id>.context.json` and to
+   the `context` section of the trace ([context-and-library.md](context-and-library.md)).
+5. The payload is not logged ([§10](#10-logging-and-secret-hygiene)).
+
+Rejection reasons:
+
+| Reason | Cause |
+|---|---|
+| `too_large` | More base64 text than the decoded cap can produce, or more than 4096 decoded bytes. |
+| `bad_base64` | A character outside the standard or url-safe base64 alphabets. |
+| `bad_json` | Valid base64 that is not UTF-8 JSON. |
+| `bad_shape` | JSON that is not an object, a version other than `1`, a section that is not an object, or a `highlight` that is not a string. |
+
+Padding is optional, and both the standard and the url-safe alphabet decode, so
+either writer is accepted.
 
 ### 4.2 `GET /healthz`
 
@@ -148,8 +215,78 @@ before exercising the authenticated path.
 | Known path, unsupported method (e.g. `GET /v1/recordings`, `PUT`, `DELETE`, `OPTIONS`) | `405` + `Allow` header | `method_not_allowed` |
 
 Both return the JSON error envelope. `GET /v1/recordings/{id}` is **not**
-implemented in v1 and therefore returns `404 not_found`; there is no download or
-delete API.
+implemented on the `/v1` prefix and therefore returns `404 not_found`. Playback
+and deletion are served by the review routes, which are unauthenticated and
+documented in [review-ui.md](review-ui.md). The development routes in §4.4-§4.6
+are exceptions to this table.
+
+### 4.4 `POST /v1/dev/ask`
+
+Authenticated development endpoint. It runs the normal background pipeline from
+a typed question, so the answer, the prompt and the trace come from the code the
+receiver uses for an upload. It is not part of a client contract and is not used
+by the Kindle.
+
+Headers: `Authorization: Bearer <token>` and `Content-Type: application/json`.
+Authentication runs before the body is read and fails with the `401` of §5.
+
+```json
+{"question": "What is a thunderhead?", "context": {}, "prompt": "", "model": ""}
+```
+
+| Field | Required | Rule |
+|---|---|---|
+| `question` | yes | Non-empty string, at most 2000 characters after trimming. |
+| `context` | no | One payload of §4.1.1 as a JSON object. It is used directly, not base64. |
+| `prompt` | no | System prompt override, at most 4000 characters. |
+| `model` | no | Model override, at most 200 characters. |
+
+Behaviour:
+
+1. A 0.1 s silent mono PCM WAV at 8 kHz, 16-bit, generated by the receiver, is
+   written through the normal recording store. It is not parsed, because it is
+   not caller-supplied audio.
+2. A trace is started with `origin: "dev"` before the response, so the feed
+   shows the ask while it runs.
+3. The typed question replaces the transcript: the `transcribe` stage is
+   recorded as `skipped` and the answer runs as it does after a real transcript.
+4. A missing OpenRouter key is not an error: the `transcribe` stage is
+   recorded as `skipped`, no answer call runs, and the ask succeeds with
+   outcome `ok`.
+5. Success is `201 Created` with `{"id": "rec_...", "trace": "rec_..."}`.
+6. A malformed body is `400 invalid_request`. A storage failure is
+   `500 storage_error`.
+
+### 4.5 `POST /api/library/sync`
+
+Authenticated development endpoint. It scans `KVB_LIBRARY_SOURCE`
+(`<storage>/library-source` by default), not a caller-supplied path: a `path`
+query parameter is ignored. Extracted books are written under `KVB_LIBRARY_DIR`.
+`?dry_run=1` computes the report and writes nothing; any other value writes the
+report under the library store's `.sync/`. Authentication is the bearer token of
+§5.
+
+Success is `200` with the sync report. A storage failure is
+`500 library_error`. The directory, the row statuses and the reason codes are in
+[context-and-library.md](context-and-library.md).
+
+### 4.6 Development dashboard routes
+
+These routes are **unauthenticated** and are intended only for the trusted LAN
+during development. Do not expose them to the public internet. `/debug` loads
+them; the dev ask and the sync above are the only routes on the page that check
+the bearer token.
+
+| Method | Path |
+|---|---|
+| `GET` | `/`, `/api/recordings`, `/recordings/{id}.wav` |
+| `DELETE` | `/api/recordings/{id}` |
+| `GET` | `/debug` |
+| `GET` | `/api/traces`, `/api/traces/{id}` |
+| `GET` | `/api/library`, `/api/logs` |
+
+The page content, the response shapes and the privacy boundary are in
+[review-ui.md](review-ui.md).
 
 ---
 
@@ -178,7 +315,12 @@ Content-Type: application/json
   the response does not distinguish them.
 - The token is never echoed, never logged (not even truncated or hashed), never
   included in errors and never written to storage.
-- The health endpoint is the only unauthenticated route.
+- The health endpoint is the only unauthenticated route on the `/v1` prefix.
+  `POST /v1/dev/ask` is authenticated and is a development route (§4.4).
+  The dashboard routes (`/`, `/api/recordings`, `/recordings/{id}.wav`,
+  `DELETE /api/recordings/{id}`, `/debug`, `/api/traces`, `/api/library` and
+  `/api/logs`) are unauthenticated and documented in
+  [review-ui.md](review-ui.md).
 
 ---
 
@@ -202,7 +344,7 @@ on `Content-Length` alone.
 4. If the body is empty (zero bytes, whether declared or streamed), respond `400
    empty_body`.
 5. Only after the full body is buffered is it validated ([§7](#7-wav-validation-provisional))
-   and stored ([§9](#9-storage-and-retention--laptop-approved-device-pending)).
+   and stored ([§9](#9-storage-and-retention)).
    The buffer is never written to disk before validation passes.
 
 Notes:
@@ -423,9 +565,13 @@ Authentication precedes every body-related check, so an unauthenticated caller
 learns nothing about limits or formats. `405` precedes `401`: an unsupported
 method on a known path is reported as such without reading credentials.
 
+The `X-KVB-Context` header is read after step 2. It is recorded and can never
+change the status: a rejected header is a trace and sidecar entry, not an HTTP
+error.
+
 ---
 
-## 9. Storage and retention — laptop approved, device pending
+## 9. Storage and retention
 
 > **Approval status.** The user approved the **laptop-side** rules R1-R5 and R8:
 > a successfully received recording in the explicitly configured storage
@@ -456,10 +602,10 @@ Rules:
 |---|---|
 | R1 | **Approved.** The storage directory is **explicitly configured**. There is no default and no fallback to the working directory. `create_app_from_env` fails at startup if `KVB_STORAGE_DIR` is unset, empty or not a usable directory. |
 | R2 | **Approved.** **No automatic deletion or expiry** in milestone 1. A successfully received recording persists in the configured laptop storage directory until a human deletes it. No TTL, no size-based pruning, no background cleanup task. |
-| R3 | **Approved.** **No read or delete HTTP API.** Access is filesystem-only: play with any WAV player, delete with the file manager. |
+| R3 | **Superseded.** The upload contract has no read or delete API, but the review dashboard adds unauthenticated read and delete routes ([review-ui.md](review-ui.md)). |
 | R4 | **Approved.** **Failed uploads leave no artifacts.** Nothing is written before validation passes, and the write procedure unlinks its temp file on any error, so a failed write leaves no `.incoming-*.part` file. A crash between temp-file creation and that unlink can leave `.incoming-*.part` leftovers; these are incomplete, are never valid recordings, are never acknowledged or served, and are removed manually. `.gitignore` excludes `.incoming-*.part` in any directory so they are never committed. |
 | R5 | **Approved.** Filenames are `<id>.wav` only. No client-supplied names, no timestamps from the client, no original filename metadata. |
-| R6 | **PENDING — not approved.** Device-side retention is undecided: whether the Kindle keeps or deletes a sample after a **failed** upload, and whether it keeps or deletes one after a **successful** upload, have not been agreed. The uploader must not delete or retain samples on the device on the strength of this document; no automatic retry and no silent retention until the user approves a device policy ([§13](#13-client-kindle-uploader-obligations)). |
+| R6 | **Implemented, pending formal approval.** Both device paths delete the WAV after a successful upload. A failed upload renames it to `<name>.failed.wav` and leaves it on the device so the operator can inspect or retry it. `upload.json` is kept for later sessions. Confirm this policy with the user before calling it approved. |
 | R7 | The storage directory must be outside any cloud-synced folder (OneDrive, Dropbox, iCloud) and must be excluded from version control. `.gitignore` excludes the runtime storage directories and `.incoming-*.part`; this document states the requirement only. |
 | R8 | **Approved.** A `201` is an acknowledgement of receipt and structural validity, not evidence of intelligibility. |
 
@@ -532,9 +678,17 @@ logs:
 
 - the token, any prefix or hash of it, the `Authorization` header;
 - the request body, any audio bytes, any base64 of audio;
-- WAV sample values, transcripts, book content, pairing keys, device serials;
+- WAV sample values, transcripts, answers, prompt text, resolved passages, book
+  content, pairing keys, device serials;
+- the `X-KVB-Context` header value and the decoded context payload: title,
+  authors, chapter, highlight and locator. The payload lives in the context
+  sidecar and the trace file, never in a log line;
 - full filesystem paths in HTTP responses (log lines may include the storage
   directory, responses may not).
+
+A stage log line carries the stage name, the recording id, the duration, the
+outcome and scalar fields only. Prompt text, passages and the context payload
+stay in the trace file ([context-and-library.md](context-and-library.md)).
 
 The default uvicorn access log (method, path, status) is acceptable; body- or
 header-logging middleware is not. Do not add middleware that buffers or echoes
@@ -549,8 +703,8 @@ identical in all of them.
 
 | Mode | Transport | Token | Notes |
 |---|---|---|---|
-| **Loopback test** (default) | `http://127.0.0.1:8000` | Any non-empty dev token | Only reachable from the laptop. Safe for the known-sample test. |
-| **Trusted-LAN test** | `http://<laptop-lan-ip>:8000` | Freshly generated, ≥32 chars | **Requires explicit user approval.** Audio and token are visible to anyone on that network. Never expose beyond the LAN. Rotate the token before any remote use. |
+| **Loopback test** (default) | `http://127.0.0.1:18767` | Any non-empty dev token | Only reachable from the laptop. Safe for the known-sample test. |
+| **Trusted-LAN test** | `http://<laptop-lan-ip>:18767` | Freshly generated, ≥32 chars | **Requires explicit user approval.** Audio and token are visible to anyone on that network. Never expose beyond the LAN. Rotate the token before any remote use. |
 | **Remote / hosted** | `https://<host>` with certificate verification | Newly generated for the deployment, never one used over plain HTTP | Verified TLS is mandatory from the first test. No self-signed exceptions, no `verify=False`, no "temporarily disable validation". |
 
 Rules:
@@ -574,7 +728,7 @@ Rules:
 - Container/deployment mechanics (image, volume mount for `KVB_STORAGE_DIR`,
   `0.0.0.0` binding *inside* the container, persistent volume requirement) are
   documented by the deployment workstream. Contractually: the container reads
-  `KVB_TOKEN` and `KVB_STORAGE_DIR` from the environment, listens on port 8000,
+  `KVB_TOKEN` and `KVB_STORAGE_DIR` from the environment, listens on port 18767,
   and requires a persistent volume — ephemeral container storage does not satisfy
   R2.
 
@@ -598,8 +752,11 @@ from dataclasses import dataclass
 class Settings:
     token: str
     storage_dir: pathlib.Path
+    library_dir: pathlib.Path | None = None
     max_body_bytes: int = 2 * 1024 * 1024
     max_duration_seconds: float = 15.0
+    debug_text: bool = True
+    log_level: str = "INFO"
 ```
 
 Validation, performed in `__post_init__` (frozen dataclass: use
@@ -611,6 +768,9 @@ Validation, performed in `__post_init__` (frozen dataclass: use
 | `storage_dir` | Accepts `str` or `os.PathLike`; normalised to `pathlib.Path(value).expanduser().resolve()`. Must not be empty. | `ValueError` |
 | `max_body_bytes` | `int` (not `bool`), `> 0`. | `ValueError` |
 | `max_duration_seconds` | `float`/`int` (not `bool`), finite, `> 0`. | `ValueError` |
+| `library_dir` | `None`, or a path with the `storage_dir` rules. `None` keeps the caller's default. | `ValueError` |
+| `debug_text` | `bool`. Keeps prompt, passage and context text in the trace when true. | `ValueError` |
+| `log_level` | Non-empty `str`; stripped and upper-cased. | `ValueError` |
 
 `Settings` is pure: it performs **no filesystem access, no environment reads and
 no logging**. Filesystem checks belong to `create_app`. Recommended token
@@ -625,11 +785,22 @@ def create_app(
     settings: Settings,
     *,
     store: RecordingStore | None = None,
+    transcribe: Callable[..., object] | None = None,
+    answer: Callable[..., object] | None = None,
+    resolve: Callable[[dict], object] | None = None,
+    trace_store: TraceStore | None = None,
 ) -> FastAPI: ...
 ```
 
 - Required call form is `create_app(settings)`. The keyword-only `store` is a
   test seam; implementations **must** accept it.
+- `transcribe` and `answer` are optional background hooks; `None` disables the
+  step. `resolve` maps a parsed context payload to
+  `(passage, rung, reason, book_key, match)`; `None` means no library.
+  `trace_store` defaults to a store in the storage directory that keeps the
+  model response and honours `settings.debug_text`.
+- A hook that names `trace` and `trace_store`, or `context_block`, `prompt` and
+  `model`, receives those values; one that does not is called as before.
 - Startup validation, in order:
   1. `settings.storage_dir` is created if missing (`mkdir(parents=True,
      exist_ok=True)`);
@@ -645,9 +816,10 @@ def create_app(
   The probe runs even when a fake `store` is injected, so configuration errors
   surface identically in tests and in production.
 - `store=None` means `LocalFileStore(settings.storage_dir)`.
-- The returned app exposes `app.state.settings` and `app.state.store` for tests,
-  and must work with `httpx.ASGITransport` and `fastapi.testclient.TestClient`
-  without a network socket.
+- The returned app exposes `app.state.settings`, `app.state.store`,
+  `app.state.trace_store` and `app.state.library` for tests, and must work with
+  `httpx2.ASGITransport` (or `httpx.ASGITransport` on the older Starlette line)
+  and `fastapi.testclient.TestClient` without a network socket.
 - `create_app` never reads environment variables and never logs the token.
 
 ### 12.3 `voice_bridge_server.app.create_app_from_env`
@@ -666,6 +838,12 @@ Used by uvicorn `--factory`. `environ=None` means `os.environ`.
 | `KVB_STORAGE_DIR` | yes | `expanduser()` + `resolve()`; must be absolute after resolution |
 | `KVB_MAX_BODY_BYTES` | no | Base-10 `int`; blank/whitespace means unset |
 | `KVB_MAX_DURATION_SECONDS` | no | `float`; blank/whitespace means unset |
+| `KVB_LIBRARY_DIR` | no | Path; extracted-book store. Defaults to `library` under `KVB_STORAGE_DIR` |
+| `KVB_LIBRARY_SOURCE` | no | Path; folder the sync scans for EPUB files. Defaults to `library-source` under `KVB_STORAGE_DIR` |
+| `KVB_ANSWER_MODEL` | no | Model id; defaults to `deepseek/deepseek-v4.1-flash-1017` |
+| `KVB_ANSWER_REASONING_EFFORT` | no | Effort name; default `low`. `none` or `off` omits the parameter |
+| `KVB_DEBUG_TEXT` | no | Bool; `0`, `false`, `no` and `off` are false, every other value is true. Default true |
+| `KVB_LOG_LEVEL` | no | Level name for the receiver and the log buffer. Default `INFO` |
 
 - Missing or blank required variable → `RuntimeError` naming the variable only,
   never its value: `"KVB_TOKEN is not set"`, `"KVB_STORAGE_DIR is not set"`.
@@ -681,7 +859,7 @@ Used by uvicorn `--factory`. `environ=None` means `os.environ`.
 ```powershell
 $env:KVB_TOKEN = "dev-only-token-replace-me"
 $env:KVB_STORAGE_DIR = "C:\Users\james\Desktop\Claude Research\kindle-voice-bridge\.data\recordings"
-python -m uvicorn voice_bridge_server.app:create_app_from_env --factory --host 127.0.0.1 --port 8000
+python -m uvicorn voice_bridge_server.app:create_app_from_env --factory --host 127.0.0.1 --port 18767
 ```
 
 ### 12.4 Storage boundary
@@ -753,8 +931,9 @@ The uploader may be implemented independently against this section alone.
    automatically.
 10. **Audio:** do not log audio bytes, do not write the sample to persistent
     device storage beyond whatever retention policy the user approves (device
-    policy currently undecided, R6), and do not include book content in the
-    request.
+    policy currently undecided, R6). Book-derived data travels only in the
+    optional `X-KVB-Context` header (§4.1.1), never in the body, a log line or
+    a filename.
 11. **Format:** send only bytes that are genuinely PCM WAV per §7. If capture
     yields encoded frames (P1), stop and raise the protocol question instead of
     labelling them PCM.
@@ -796,10 +975,10 @@ both under the 2 MiB cap (P6).
 ### 14.2 Health and manual smoke test
 
 ```powershell
-curl.exe -sS http://127.0.0.1:8000/healthz
+curl.exe -sS http://127.0.0.1:18767/healthz
 # {"status":"ok","api_version":"v1"}
 
-curl.exe -sS -X POST http://127.0.0.1:8000/v1/recordings `
+curl.exe -sS -X POST http://127.0.0.1:18767/v1/recordings `
   -H "Authorization: Bearer $env:KVB_TOKEN" `
   -H "Content-Type: audio/wav" `
   --data-binary "@sample.wav" `
@@ -890,8 +1069,9 @@ Flagged for the hardware workstream; each answer may require a protocol revision
 
 - This document is the contract. Changes require coordinator approval and must be
   reflected in the receiver, the uploader and both test suites in the same batch.
-- Additive changes that do not break v1: new optional response fields, new
-  `error.code` values for new conditions, new optional environment variables.
+- Additive changes that do not break v1: new optional request headers, new
+  optional response fields, new `error.code` values for new conditions, new
+  optional environment variables.
 - Breaking changes (path, auth scheme, content type, required fields, status
   semantics) require a new path version (`/v2/...`), not a silent edit.
 - Provisional items P1-P6 and the **device-side** retention policy (§9, R6) are

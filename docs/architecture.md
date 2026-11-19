@@ -11,9 +11,15 @@ microphone and sends the audio to a computer.
 
 ## How a recording flows
 
-The computer is the HFP Audio Gateway. The Kindle relays raw HCI from its
-Bluetooth UART to the computer over one outbound TCP connection. The Kindle
-blocks inbound TCP. The computer listens, and the Kindle starts the connection.
+The Kindle is the HFP Audio Gateway. `bt_session.py` takes the Bluetooth UART,
+runs Bumble on the device, and captures the headset microphone. It writes a WAV
+to `/tmp`, uploads it over Wi-Fi to the receiver, and deletes it. The receiver
+validates and stores the file, transcribes it, asks a cheap LLM for an answer,
+and writes both sidecars next to the WAV. The plugin polls the daemon's state
+file and shows the answer.
+
+The laptop HCI relay, described under [Diagnostic: laptop HCI capture](#diagnostic-laptop-hci-capture),
+is a separate experiment and is not used by the plugin.
 
 The laptop tools need Bumble 0.0.236. Install the optional dependency from the
 project directory:
@@ -29,7 +35,7 @@ Bumble also runs on the bundled Python 3.11.17 of the Kindle with the
 Bumble `power_off()` does not restore the stock Bluetooth of the Kindle. Read
 [recovery.md](recovery.md). Authorize the handoff before an HCI test.
 
-### Laptop HCI capture
+### Diagnostic: laptop HCI capture
 
 The commands for the key conversion, the listener, and the WAV conversion are in
 [hardware-tests.md](hardware-tests.md). Start the listener first. Wait for
@@ -62,7 +68,8 @@ The `deploy` command copies `capture_local.py`, `bt_session.py`,
 `pw4_supervisor.py`, `uploader.py`, `hci_relay.py`, and `launch_hci.py` to
 `/mnt/us/kindle-voice-bridge/`. It copies the KOReader plugin to
 `/mnt/us/koreader/plugins/voicebridge.koplugin/`. It does not copy the Python
-runtime or the Bumble bundle.
+runtime or the Bumble bundle; run `tools\kvb.ps1 install-runtimes` once to copy
+them.
 
 ### One-shot capture
 
@@ -97,9 +104,9 @@ LD_LIBRARY_PATH=/mnt/us/kindle-voice-bridge/python31117/lib \
   --confirm-bluetooth-enabled-in-ui
 ```
 
-Add `--headset 95:05:BB:2A:34:2E` when the pairing store holds more than one
-device. The script prints one line that starts with `Result: `. The plugin reads
-that line and shows the result.
+Add `--headset <headset-address>` when the pairing store holds more than one
+device. The script prints one line that starts with `Result: `. This path is run
+from a device shell; the plugin does not call it.
 
 ### Resident session
 
@@ -133,7 +140,9 @@ Add `--headset 95:05:BB:2A:34:2E` when the pairing store holds more than one
 device. Add `--idle-timeout 1800` to change the idle limit. Add `--keep-latency`
 to keep the CPU latency hold for the whole session. Add `--send-silence` to send
 silent PCM packets to the headset at a fixed rate during each capture. The
-default is off.
+default is off. Add `--cue-delay 2.5` to change the wait after the microphone is
+live before the cue. Add `--context-file` to point at a different reading-context
+file; the default is `/tmp/voicebridge-context.json`.
 
 Start one session at a time. A second start fails before the Bluetooth handoff.
 
@@ -156,10 +165,27 @@ Start one session at a time. A second start fails before the Bluetooth handoff.
   It does not show a stale countdown.
 - The capture stores packets from the first callback and does not use the settle
   detector. The daemon trims every packet before the cue, so the file starts
-  where the microphone became live. The 15 s cap counts only audio after the
+  just before the cue, not at SCO open. The 15 s cap counts only audio after the
   cue.
 - The daemon waits up to 4 s for a signal. If no signal appears, it cues anyway
   and records from that point.
+
+### Cue delay and startup artifact
+
+The receive path delivers about 2.5 s of startup artifact after SCO open. A cue
+at that point would include it in the upload and lose the start of the speech.
+
+The daemon waits for the audio-ready event, which means the headset is converting
+audio. It then waits `--cue-delay` seconds, default 2.0, cues the operator, and
+keeps a 0.2 s pre-roll before the cue. Everything before that point is dropped
+from the uploaded WAV, so the file starts with the speech and not with the ramp.
+The daemon prints `Audio: cue delayed 2 s.` when the delay runs.
+
+- A delay of 0 keeps the previous behaviour: the cue fires at the audio-ready
+  event and nothing is trimmed.
+- The capture cap counts only audio after the trim.
+- If no signal appears within 4 s, the daemon cues anyway and records from that
+  point, so a quiet handset never blocks a recording.
 
 ### Control protocol
 
@@ -237,6 +263,53 @@ while new recordings and LLM responses arrive. The page is
 unauthenticated and is for the trusted LAN during development. Do not expose the
 page to the public internet. The detail is in [review-ui.md](review-ui.md).
 
+### Reading context
+
+The Kindle sends a pointer, not page text, and the receiver resolves it against
+a synced book. Page text extraction costs about 0.5-1 s on the device, so it
+does not run in the ask path. The payload and the resolution rules are in
+[context-and-library.md](context-and-library.md).
+
+1. The plugin writes `/tmp/voicebridge-context.json`: book title, authors, page,
+   total pages, fraction, chapter, locator and the highlighted text. Every
+   getter runs in its own `pcall`, so a missing document API yields no context
+   and never blocks the ask.
+2. The daemon reads and unlinks the file when the capture starts, then sends the
+   bytes base64url-encoded in the optional `X-KVB-Context` header.
+3. The receiver decodes the header and writes `<id>.context.json` beside the WAV.
+   A rejected header is recorded and the upload still returns 201.
+4. The receiver resolves the context to a passage. The rungs are `highlight`,
+   then `fraction` against a synced book, then none.
+5. The passage and the book block go into the user message of the answer call,
+   framed between `READING CONTEXT` and `END READING CONTEXT`.
+6. One trace file per ask records the decoded context, the book key and match,
+   the rung, the reason, the passage and the exact messages.
+
+### Library sync
+
+`POST /api/library/sync` scans `KVB_LIBRARY_SOURCE` for EPUB files, extracts the
+text in spine order and writes one folder per book under `KVB_LIBRARY_DIR`
+(`<storage>/library` by default). `?dry_run=1` returns the report and writes
+nothing.
+Books are identified by a hash of the normalised title and authors; file size and
+partial md5 are aliases for matching a stored copy. The storage layout, the row
+statuses and the reason codes are in
+[context-and-library.md](context-and-library.md).
+
+### Traces and the debug page
+
+Each ask writes `<id>.trace.json` beside the WAV: the decoded context, the book
+match, the stage timings, the resolved passage, the exact model messages, the
+usage and the cost. The file is rewritten through a temporary file and an atomic
+rename after each stage. The feed, the detail panel, the dev ask, the library
+table and the log tail are on `/debug`, described in [review-ui.md](review-ui.md).
+`KVB_DEBUG_TEXT=0` hides prompt text, the passage and the context text fields
+while keeping the stages.
+
+A stage log line carries the stage name, the recording id, the duration and the
+outcome only. Prompt text, passages and the context payload stay in the trace
+file.
+
 ### Host upload check
 
 To send a mono PCM WAV file from the computer, set `KVB_TOKEN` to the token of
@@ -261,7 +334,7 @@ To run the receiver with transcription from a shell:
 
 ```powershell
 $env:OPENROUTER_API_KEY = "<key>"
-python -m uvicorn voice_bridge_server.app:create_app_from_env --factory --host 0.0.0.0 --port 18767
+python -m uvicorn voice_bridge_server.app:create_app_from_env --factory --host 127.0.0.1 --port 18767
 ```
 
 `tools/transcribe_worker.py --once` backfills a storage directory that the
@@ -277,14 +350,27 @@ clip, and what to try if 8 kHz audio transcribes poorly are in
 
 When the transcript is not empty, a second call asks a chat model for a short
 answer to the question. The default is
-`mistralai/mistral-small-24b-instruct-2501`, about $0.000006 per answer. The
-answer is written to `<id>.answer.json`.
+`deepseek/deepseek-v4.1-flash-1017` at low reasoning effort. An answer costs
+well under $0.001, even when the model searches the book first. The answer is
+written to `<id>.answer.json`.
 
 The daemon reads the answer through `GET /v1/recordings/{id}/answer`, which uses
 the same bearer token as the upload. The endpoint returns `pending`, `ready` or
 `failed`. The daemon polls once per second for up to 60 seconds and publishes
 the text as the second line of the state file. The plugin shows **RESPONSE
 READY** in the strip, and a tap opens the text in a popup.
+
+### Answer text on the strip
+
+The answer state line keeps UTF-8, because the answer may contain accented
+characters or quotes that the ASCII formatter would replace. `answer_text()`
+strips C0 control characters except newline and tab, collapses runs of
+whitespace and newlines to one space, and caps the line at 480 characters. A
+longer answer is cut at 477 characters and ends with `...`.
+
+`safe_text()` remains the ASCII formatter for log lines and error replies. The
+answer sidecar keeps the full text; the cap applies to the one-line state field
+only.
 
 ## Host helper
 
@@ -294,6 +380,7 @@ The `tools\kvb.ps1` script is the single entry point for the host operations.
 - `transcriber` starts `tools/transcribe_worker.py --interval 5` in the
   background. The command needs the key file.
 - `deploy` copies the device files to a mounted Kindle.
+- `install-runtimes` copies CPython and Bumble to a mounted Kindle once.
 - `test` runs `python -m pytest -q`.
 - `help` prints the usage text.
 
@@ -311,7 +398,7 @@ the project directory:
 
 ```powershell
 python -m pip install -e .
-$env:KVB_TOKEN = python -c "import secrets; print(secrets.token_urlsafe(32))"
+$env:KVB_TOKEN = (python -c "import secrets; print(secrets.token_urlsafe(32))")
 $env:KVB_STORAGE_DIR = "$env:LOCALAPPDATA\KindleVoiceBridge\recordings"
 python -m uvicorn voice_bridge_server.app:create_app_from_env --factory --host 127.0.0.1 --port 18767
 ```

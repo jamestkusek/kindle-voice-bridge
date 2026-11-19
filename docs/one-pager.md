@@ -19,8 +19,9 @@ back — with a tap and a spoken sentence instead of a paragraph of typing?
 
 ## Who it's for
 
-Primarily me: a heavy Kindle reader who wants low-friction explanations while reading. More broadly, anyone using KOReader's LLM features
-who would rather talk than type using the keyboard.
+Primarily me: a heavy Kindle reader who wants low-friction explanations while
+reading. More broadly, anyone using KOReader's LLM features who would rather
+talk than type on the keyboard.
 
 ## What I built
 
@@ -30,15 +31,12 @@ and read the LLM's answer on the Kindle.
 - **KOReader plugin (Lua)** — starts and stops the Bluetooth session, opens the
   live recording strip, shows the answer in a popup, and exposes the same action
   to KOReader gestures through the Dispatcher.
-- **Kindle-side capture supervisor (Python 3.11)** — stops the stock Bluetooth
-  daemon, takes the Broadcom UART (`/dev/ttymxc2`) from `bsa_server`, switches it
-  to raw H:4, and relays it to the laptop over an outbound TCP connection (the
-  Kindle blocks inbound connections). It restores stock Bluetooth on exit
-  (observed, not guaranteed).
-- **Laptop-side HFP Audio Gateway (Bumble)** — pairs with the headset using the
-  exported link keys, negotiates HFP, opens the SCO voice link, and captures the
-  mic stream. It detects and discards about 2.4 s of stale SCO buffer at the
-  start, then records the clip.
+- **Kindle-side capture daemon (Python 3.11 + Bumble)** — stops the stock
+  Bluetooth daemon, takes the Broadcom UART (`/dev/ttymxc2`) from `bsa_server`,
+  runs an HFP Audio Gateway on the device, and captures the headset microphone.
+  It detects and discards about 2.5 s of stale SCO buffer at the start, writes a
+  WAV, uploads it, and restores stock Bluetooth on exit (observed, not
+  guaranteed).
 - **Receiver and upload path (FastAPI)** — an authenticated
   `POST /v1/recordings` endpoint with strict WAV validation, size and duration
   caps, atomic storage, and a Kindle-side uploader. The receiver transcribes the
@@ -54,31 +52,32 @@ and read the LLM's answer on the Kindle.
 ## What's proven, and what isn't
 
 Proven on real hardware: Bluetooth handoff and restoration, Bumble driving the
-Kindle controller over the relay, an HFP Audio Gateway reaching SCO, intelligible
-voice capture, and the full loop in one session — capture, Wi-Fi upload,
-transcription, LLM answer, and the answer shown in KOReader.
+Kindle controller, an HFP Audio Gateway reaching SCO, intelligible voice capture,
+and the full loop across hardware runs — capture, Wi-Fi upload, transcription,
+LLM answer, and the answer shown in KOReader.
 
 Still open: the audio format is a strong inference (PCM16 mono 8 kHz), not
 controller-confirmed; Wi-Fi/Bluetooth coexistence during capture is not measured;
-the laptop is still in the loop; the relay is plaintext and unauthenticated; and
-only one headset and one firmware version have been tested. The question is sent
+the laptop is still in the loop; the diagnostic HCI relay is plaintext and
+unauthenticated; and only one headset and one firmware version have been tested. The question is sent
 without the current page or chapter as context.
 
 ## What I'd do next
 
-1. **Add reading context.** This is the most important one for me.
-Send the current page, chapter and book title with
-   the question, so answers can use the passage the reader is looking at. I also want to
-complement this server side with a knowledge graph that builds up as the user asks queries, so
-the system learns what style of response the user likes, and what they already know. Furthermore,
-the knowledge graph can also capture all the books the user asks questions about, so it can easily
-look them up for accurate answers.
-
-2. **Remove the laptop.** Move the receiver to a hosted HTTPS service, so we can configure a simple URL/IP address to send queries to.
-3. **Improve the UI ** A single button to press to talk, which detects when you have finished your question, automatic pop-up of response,
- would all reduce friction in the user flow.
-4. **Broaden support.** Make this system OS-agnostic, so you can run it on
-Linux or Windows. Add support for more Kindle models and more types of bluetooth headsets.
+1. **Add reading context.** This is the most important one for me: send the
+   current page, chapter and book title with the question, so answers can use
+   the passage the reader is looking at. Server-side, I would complement this
+   with a knowledge graph that builds up as the user asks queries — learning
+   what style of response the user likes, what they already know, and which
+   books they ask about, so it can look them up for accurate answers.
+2. **Remove the laptop.** Move the receiver to a hosted HTTPS service, so the
+   Kindle only needs a single URL to send queries to.
+3. **Improve the UI.** A single press-to-talk button that detects when the
+   question has ended, plus an automatic answer popup, would both cut friction
+   from the user flow.
+4. **Broaden support.** Make the system OS-agnostic so it runs on Linux as well
+   as Windows, and add support for more Kindle models and more Bluetooth
+   headsets.
 
 ## Status
 

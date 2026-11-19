@@ -40,9 +40,15 @@ stop_recording runs automatically at the cap. A separate phase query lets the
 plugin show preparation, recording, and sending progress. The legacy record
 command remains available for the fixed five-second convenience action.
 
-Manual audio starts at SCO readiness. Its beginning may contain startup
-artifact or silence because there is no settle wait. This is an intentional
-trade-off for capturing the earliest audio.
+Manual audio starts when the microphone is live. --cue-delay waits after that
+point before the cue, then trims everything before the cue minus a short
+pre-roll. This removes startup artifact from the uploaded WAV. A delay of 0
+keeps the untrimmed behaviour.
+
+The plugin writes the reading context to --context-file before it queues
+start_recording. The daemon reads and removes the file when the capture
+starts, and sends the bytes as the X-KVB-Context header. A missing or
+unreadable file is normal and uploads without the header.
 
 --send-silence sends paced silent PCM downlink packets during each capture.
 Some handsets may start their microphone only after downlink audio arrives.
@@ -84,6 +90,12 @@ except ImportError:  # Windows test hosts have no fcntl.
 SOCKET_PATH = "/tmp/voicebridge-bt-session.sock"
 STATE_PATH = "/tmp/voicebridge-bt-session.state"
 COMMAND_PATH = "/tmp/voicebridge-bt-session.cmd"
+CONTEXT_PATH = "/tmp/voicebridge-context.json"
+# Seconds to wait after the microphone is live before the cue.
+CUE_DELAY_SECONDS = 2.0
+# Seconds of pre-cue audio kept before the trim point.
+CUE_PREROLL_SECONDS = 0.2
+ANSWER_LIMIT = 480
 STATE_INTERVAL_SECONDS = 0.1
 # The receiver answers a question after it transcribes it. The daemon polls for
 # that answer and publishes it in the state file.
@@ -155,12 +167,30 @@ def unpack_record(outcome):
 
 
 def safe_text(value, limit=200):
-    """Return one printable ASCII line with no control characters."""
+    """Return one printable ASCII line with no control characters.
+
+    This is the formatter for logs and errors. Answer text uses answer_text.
+    """
     text = "".join(char if 32 <= ord(char) < 127 else " " for char in str(value))
     text = " ".join(text.split())
     if len(text) > limit:
         text = text[:limit - 3] + "..."
     return text or "unknown"
+
+
+def answer_text(value, limit=ANSWER_LIMIT):
+    """Return the answer as one UTF-8 line, cut at ``limit`` characters.
+
+    C0 control characters are removed except newline and tab. Newlines and
+    runs of spaces collapse to one space, so the line stays single-line.
+    """
+    kept = "".join(char for char in str(value)
+                   if char in "\n\t" or ord(char) >= 32)
+    kept = kept.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ")
+    text = " ".join(" ".join(kept.split("\n")).split())
+    if len(text) > limit:
+        text = text[:limit - 3] + "..."
+    return text or "-"
 
 
 def positive_int(value):
@@ -180,6 +210,28 @@ def positive_float(value):
         raise argparse.ArgumentTypeError("Enter a number of seconds.")
     if not number > 0:
         raise argparse.ArgumentTypeError("Enter a number greater than zero.")
+    return number
+
+
+def cue_trim_offset(length, sample_rate, sample_width):
+    """Return the first byte to keep after the cue delay.
+
+    A short pre-roll keeps the audio just before the cue, so the trim drops the
+    startup ramp without cutting the first word.
+    """
+    preroll = int(round(CUE_PREROLL_SECONDS * sample_rate * sample_width))
+    offset = max(0, int(length) - preroll)
+    # Keep whole 16-bit samples.
+    return offset - offset % 2
+
+
+def non_negative_float(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("Enter a number of seconds.")
+    if not number >= 0:
+        raise argparse.ArgumentTypeError("Enter zero or more seconds.")
     return number
 
 
@@ -241,7 +293,8 @@ class Session:
                  capture_local, uploader, pw4_supervisor,
                  keep_latency=False, control_factory=None,
                  manual_max_duration=MAX_MANUAL_RECORD_SECONDS,
-                 state_path=STATE_PATH, command_path=COMMAND_PATH):
+                 state_path=STATE_PATH, command_path=COMMAND_PATH,
+                 context_path=CONTEXT_PATH):
         self.experiment = experiment
         self.controller_factory = controller_factory
         self.config = config
@@ -268,6 +321,9 @@ class Session:
             raise ValueError("manual_max_duration must be greater than zero")
         self.state_path = state_path
         self.command_path = command_path
+        self.context_path = context_path
+        # The bytes the plugin left for the next recording, or None.
+        self.context_bytes = None
         self.state_task = None
         self.link_task = None
         self.answer_task = None
@@ -382,10 +438,13 @@ class Session:
             await asyncio.sleep(ANSWER_POLL_SECONDS)
 
     def answer_body(self):
-        """Return the answer line for the state file."""
+        """Return the answer line for the state file.
+
+        The line keeps UTF-8 and is capped by characters.
+        """
         if not self.last_answer:
             return "-"
-        return safe_text(self.last_answer, 400).replace("\n", " ")
+        return answer_text(self.last_answer, ANSWER_LIMIT)
 
     def state_body(self):
         """Return one machine-readable state line without the ok prefix.
@@ -417,7 +476,8 @@ class Session:
                 f"answer {self.answer_body()}\n")
         temporary = self.state_path + ".tmp"
         try:
-            with open(temporary, "w", encoding="ascii", errors="replace") as target:
+            with open(temporary, "w", encoding="utf-8",
+                      errors="replace") as target:
                 target.write(line)
             try:
                 os.chmod(temporary, 0o600)
@@ -552,6 +612,11 @@ class Session:
         self.recording = True
         self.record_kind = "manual"
         self.manual_stop_event = stop_requested
+        # A poll from the previous recording can still be in flight. Cancel it,
+        # or its answer lands on this recording and is shown as the response.
+        if self.answer_task is not None:
+            self.answer_task.cancel()
+            self.answer_task = None
         self.last_record_result = None
         self.last_answer = None
         self.last_recording_id = None
@@ -570,11 +635,36 @@ class Session:
             ready = self._begin_manual_recording()
         return await asyncio.shield(ready)
 
+    def take_context(self):
+        """Read and remove the context the plugin wrote for the next capture.
+
+        A missing or unreadable file is normal. The recording then uploads
+        without a context header. The payload is never logged.
+        """
+        data = None
+        if self.context_path:
+            try:
+                with open(self.context_path, "rb") as source:
+                    data = source.read()
+            except OSError:
+                data = None
+            try:
+                os.unlink(self.context_path)
+            except OSError:
+                pass
+        self.context_bytes = data
+        size = len(data) if data else 0
+        print(f"Context: {size} bytes.", flush=True)
+        return data
+
     async def start_from_command(self):
         """Start a manual capture for the plugin, which watches the state file."""
         async with self.record_state_lock:
             if self.stop_event.is_set() or self.recording:
                 return
+            # Read the context once, before the capture, so a stale file
+            # never attaches to a later recording.
+            self.take_context()
             self._begin_manual_recording()
 
     async def stop_recording_line(self):
@@ -604,6 +694,7 @@ class Session:
                 self.manual_stop_event = None
                 self.recording_started_at = None
                 self.capture_limit = None
+                self.context_bytes = None
                 self.set_phase("idle")
                 self.last_activity = time.monotonic()
             self.write_state_file()
@@ -782,7 +873,10 @@ class Session:
             upload_task = asyncio.create_task(asyncio.to_thread(
                 self.uploader.upload_recording,
                 path, self.config["server_url"], self.config["token"],
-                timeout=self.upload_timeout, allow_insecure_lan=True))
+                timeout=self.upload_timeout, allow_insecure_lan=True,
+                # The daemon already read and removed the file, so the
+                # uploader takes the bytes.
+                context_path=self.context_bytes))
             try:
                 result = await asyncio.shield(upload_task)
             except asyncio.CancelledError:
@@ -792,7 +886,15 @@ class Session:
                 except Exception:
                     pass
                 raise
-        finally:
+        except BaseException:
+            # A failed upload must not destroy the only copy of the audio. Keep
+            # it beside the temporary file so the operator can retry by hand.
+            try:
+                os.replace(path, os.path.splitext(path)[0] + ".failed.wav")
+            except OSError:
+                pass
+            raise
+        else:
             try:
                 os.remove(path)
             except OSError:
@@ -800,6 +902,8 @@ class Session:
         recording_id = result.get("id") if isinstance(result, dict) else None
         if isinstance(recording_id, str) and recording_id:
             self.last_recording_id = recording_id
+            if self.config["token"] not in recording_id:
+                print(f"Upload: {safe_text(recording_id, 80)}.", flush=True)
         return self.format_result(
             result, len(pcm), settle_seconds,
             max_duration_reached=max_duration_reached)
@@ -1040,11 +1144,15 @@ class UnixControl:
 class BumbleController:
     """One powered Bumble controller that survives across recordings."""
 
-    def __init__(self, capture_local, keystore, address, send_silence=False):
+    def __init__(self, capture_local, keystore, address, send_silence=False,
+                 cue_delay=CUE_DELAY_SECONDS):
         self.capture_local = capture_local
         self.keystore = keystore
         self.address = address
         self.send_silence = send_silence
+        if cue_delay < 0:
+            raise ValueError("cue_delay must be zero or more")
+        self.cue_delay = float(cue_delay)
         self.on_phase = None
         self.transport = None
         self.device = None
@@ -1244,6 +1352,8 @@ class BumbleController:
                 capture.force_cue()
                 print("Audio: no signal before the deadline; cueing anyway.",
                       file=sys.stderr, flush=True)
+            if self.cue_delay:
+                await self._delay_cue(capture)
             self._notify_phase("recording")
             return capture
         except asyncio.CancelledError:
@@ -1259,6 +1369,20 @@ class BumbleController:
                   file=sys.stderr, flush=True)
             raise self.capture_local.CaptureFailure(
                 f"The {self.capture_local.PHASE_NAMES[phase]} step failed.") from error
+
+    async def _delay_cue(self, capture):
+        """Wait after the microphone is live, then trim the startup artifact.
+
+        The headset needs a moment to settle after SCO opens. The cue comes
+        after the delay, and the audio before it is dropped.
+        """
+        delay = self.cue_delay
+        await asyncio.sleep(delay)
+        capture.cue_offset = cue_trim_offset(
+            len(capture.data), self.capture_local.SAMPLE_RATE,
+            self.capture_local.SAMPLE_WIDTH)
+        capture.cue_at = time.monotonic()
+        print(f"Audio: cue delayed {delay:g} s.", flush=True)
 
     async def stop_recording(self):
         """Close the current SCO audio capture and return its PCM report."""
@@ -1495,6 +1619,14 @@ def build_parser():
                         metavar="SECONDS",
                         help="Stop after this many seconds without a recording. "
                              "The default is 1800.")
+    parser.add_argument("--context-file", default=CONTEXT_PATH, metavar="PATH",
+                        help="Reading context file. The daemon reads and removes it "
+                             "when a recording starts. The default is " + CONTEXT_PATH + ".")
+    parser.add_argument("--cue-delay", type=non_negative_float,
+                        default=CUE_DELAY_SECONDS, metavar="SECONDS",
+                        help="Wait this long after the microphone is live before "
+                             "the cue, and trim the audio before it. 0 keeps the "
+                             "previous behaviour. The default is 2.0.")
     parser.add_argument("--keep-latency", action="store_true",
                         help="Keep the CPU latency hold for the whole session. "
                              "The default releases it between recordings.")
@@ -1553,6 +1685,8 @@ def main(argv=None):
     else:
         print("The CPU latency hold is released between recordings.", flush=True)
     print(f"Downlink silence: {'on' if args.send_silence else 'off'}.", flush=True)
+    print(f"The context file is {args.context_file}.", flush=True)
+    print(f"The cue delay is {args.cue_delay:g} seconds.", flush=True)
 
     def raise_interrupt(signum, frame):
         raise pw4_supervisor.Interrupted(f"Signal {signum} stopped the session.")
@@ -1561,7 +1695,8 @@ def main(argv=None):
     session = Session(
         experiment=experiment,
         controller_factory=lambda: BumbleController(
-            capture_local, keystore, address, send_silence=args.send_silence),
+            capture_local, keystore, address, send_silence=args.send_silence,
+            cue_delay=args.cue_delay),
         config=config,
         socket_path=args.socket,
         lock_path=args.socket + ".lock",
@@ -1572,6 +1707,7 @@ def main(argv=None):
         uploader=uploader,
         pw4_supervisor=pw4_supervisor,
         keep_latency=args.keep_latency,
+        context_path=args.context_file,
     )
 
     old_handlers = {}

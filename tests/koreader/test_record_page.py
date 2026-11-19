@@ -19,6 +19,12 @@ PLUGIN = ROOT / "koreader" / "voicebridge.koplugin" / "main.lua"
 def test_record_page_state_machine(tmp_path, monkeypatch):
     monkeypatch.setenv("VOICEBRIDGE_PLUGIN", str(PLUGIN))
     monkeypatch.setenv("VOICEBRIDGE_STATE", str(tmp_path / "session.state"))
+    # Ask the spec to return its counts instead of calling os.exit(1), which
+    # would abort the whole pytest process with no test name or message.
+    monkeypatch.setenv("VOICEBRIDGE_SPEC_REPORT", "1")
 
     lua = lupa.LuaRuntime()
-    lua.execute(SPEC.read_text(encoding="utf-8"))
+    summary = lua.execute(SPEC.read_text(encoding="utf-8"))
+
+    assert summary["checks"] >= 50, "the spec ran almost no checks"
+    assert summary["failures"] == 0, f"{summary['failures']} of {summary['checks']} Lua checks failed"

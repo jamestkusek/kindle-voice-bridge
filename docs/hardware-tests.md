@@ -338,7 +338,8 @@ file when testing is finished.
   hypothesis. The option is off by default and has not run on hardware.
 - The one-shot path still hands Bluetooth off and restores it per run. The
   resident session is reported to hand off once and preserve the link across
-  multiple recordings; the new manual audio path is not hardware-verified.
+  multiple recordings. The manual path has produced recordings and uploads on
+  the device; the 15 s cap and the e-ink refresh cost remain unverified.
 - The earlier captures began with a non-speech artifact, likely a stale or
   unfed SCO receive buffer. The on-device run did not show it.
   `tools/hfp_capture.py` discards it: a 0.40 s sliding window must show a small

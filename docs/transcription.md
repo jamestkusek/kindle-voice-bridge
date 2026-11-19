@@ -38,7 +38,7 @@ to models whose `architecture.input_modalities` include `audio`.
 
 | Model | Prompt | Audio | Note |
 | --- | --- | --- | --- |
-| `mistralai/voxtral-small-24b-2507` | $0.10/M | **$0.10/M** | Purpose-built ASR (Voxtral Small 24B) |
+| `mistralai/voxtral-small-24b-2507` | $0.10/M | **$0.0001 per audio token** | Purpose-built ASR (Voxtral Small 24B) |
 | `google/gemini-2.5-flash-lite` | $0.10/M | $0.30/M | General model, strong audio understanding |
 | `openai/gpt-audio-mini` | $0.60/M | $0.60/M | Chat-oriented audio model |
 | `google/gemini-2.5-flash` | $0.30/M | $1.00/M | Overkill for 8 kHz narrowband |
@@ -68,11 +68,13 @@ cost ≈ $0.0000043 (the text prompt) + $0.0001 × seconds of audio
      ≈ $0.006 per minute of audio
 ```
 
-That is about **thirty times** what comparing the `prompt` field alone suggests.
-The `audio` price in the model listing is per audio token, and audio tokens are
-roughly one per second — not the ~25-32 tokens per second that Gemini-style
-audio tokenisation uses. Reading the listing's `prompt` price as the audio price
-underestimates the bill by an order of magnitude.
+Measured against a prompt-rate estimate of about $0.0000058 (the text prompt
+plus 15 audio tokens priced at the prompt rate), the real bill of $0.0015181 is
+about **260 times** higher. The `audio` price in the model listing is per audio
+token, and audio tokens are roughly one per second — not the ~25-32 tokens per
+second that Gemini-style audio tokenisation uses. Reading the listing's
+`prompt` price as the audio price underestimates the bill by two orders of
+magnitude.
 
 For comparison, `google/gemini-2.5-flash-lite` at $0.0000003 per audio token with
 ~25 tokens per second lands near **$0.00013 per 15-second clip**, roughly eleven
@@ -82,8 +84,10 @@ the accuracy option. At prototype volume the difference is cents.
 ## The answer model
 
 After the transcript, the receiver asks a second model for a short answer to the
-question. The default is `mistralai/mistral-small-24b-instruct-2501`. Override it
-with `KVB_ANSWER_MODEL`.
+question. The default is `deepseek/deepseek-v4.1-flash-1017` at low reasoning
+effort, because the book search supplies the facts and a long reasoning trace
+only adds latency. Override the model with `KVB_ANSWER_MODEL` and the effort
+with `KVB_ANSWER_REASONING_EFFORT`; `none` or `off` omits the effort.
 
 The answer is short, so a large model buys nothing. Measured on the question
 "what is a thunderhead?":
@@ -95,9 +99,10 @@ The answer is short, so a large model buys nothing. Measured on the question
 | `mistralai/ministral-3b-2512` | $0.100 / $0.100 | two sentences | $0.0000107 |
 | `google/gemini-2.5-flash-lite` | $0.100 / $0.400 | two sentences | $0.0000198 |
 
-Mistral Small 24B is the default because it gave the clearer two-sentence
-answer at a cost that is not worth tuning further. Use `mistral-nemo` when one
-sentence is enough and the lowest cost matters.
+The table was measured on `mistral-small-24b-instruct-2501`, which was the
+default at the time. The current default is DeepSeek V4.1 Flash; the costs above
+describe the shape of the trade-off, not a quote for the current model. Use
+`mistral-nemo` when one sentence is enough and the lowest cost matters.
 
 ### If the transcripts come back poor
 

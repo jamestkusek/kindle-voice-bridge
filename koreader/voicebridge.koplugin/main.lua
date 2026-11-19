@@ -21,25 +21,6 @@ local base_path = "/mnt/us/kindle-voice-bridge"
 local state_path = "/tmp/voicebridge-bt-session.state"
 local command_path = "/tmp/voicebridge-bt-session.cmd"
 
-
-
-
--- Read-only. This command imports Python modules and writes one report file.
--- It does not open the UART, start Bluetooth, or change any device state.
-
--- Manual start only. This command stops the stock Bluetooth daemon and
--- restores it in a finally path. The script reads upload.json and keeps it so
--- later runs reuse it. The result line is written to the log.
-
--- The session client uses only the Python standard library. It sends one line
--- to the daemon and prints one line. It does not import Bumble.
-
--- The phase command reports preparing, recording, sending, idle, or stopping.
--- It is additive. An older daemon replies with an error, and the plugin keeps
--- the preparing message until the result arrives.
-
-
-
 -- Manual start only. The daemon performs the Bluetooth handoff once and
 -- restores Bluetooth when it stops. The daemon reads upload.json and keeps it
 -- for later sessions.
@@ -147,43 +128,21 @@ local function run(command)
     if read_ok then return text end
 end
 
-local function read(path)
-    local file = io.open(path, "r")
-    if not file then return nil end
-    local read_ok, text = pcall(file.read, file, "*a")
-    pcall(file.close, file)
-    if read_ok then return text end
-end
-
--- The device script prints one line that starts with "Result: ".
-local function last_result(text)
-    if not text then return nil end
-    local result = nil
-    for line in text:gmatch("[^\n]+") do
-        if line:sub(1, 8) == "Result: " then
-            result = line:sub(9)
-        end
-    end
-    return result
-end
-
-local function save(path, text)
-    local file = io.open(path, "w")
-    if not file then return false end
-    local written = file:write(text)
-    local closed = file:close()
-    return written and closed
-end
-
 local VoiceBridge = WidgetContainer:extend{
     name = "voicebridge",
     is_doc_only = false,
     record_page = nil,
+    selected_text = nil,
+    state_path = nil,
+    command_path = nil,
+    context_path = nil,
+    context_log_path = nil,
 }
 
 function VoiceBridge:init()
     self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
+    self:registerHighlightEntry()
 end
 
 -- One gesture toggles manual capture in an active resident session.
@@ -252,6 +211,264 @@ local function read_state(path)
         result = result,
         answer = answer,
     }
+end
+
+-- Reading context -----------------------------------------------------------
+--
+-- One optional JSON file per ask: /tmp/voicebridge-context.json, which the
+-- daemon reads when the capture starts. Every getter runs in its own pcall, so
+-- a build without one API loses only that field, and a missing document loses
+-- the whole file.
+
+local context_path = "/tmp/voicebridge-context.json"
+local context_log_path = "/tmp/voicebridge-context.log"
+-- The daemon's header cap is 4096 decoded bytes, after base64 expansion.
+local context_max_bytes = 2500
+local highlight_entry_id = "voicebridge_ask"
+
+local function attempt(getter)
+    local ok, value = pcall(getter)
+    if ok then return value end
+    return nil
+end
+
+local function as_text(value)
+    if type(value) == "string" then return value end
+    return nil
+end
+
+local function as_count(value)
+    if type(value) == "number" and value >= 0 then
+        return math.floor(value)
+    end
+    return nil
+end
+
+-- KOReader reports authors as one string on some builds and a list on others.
+local function author_list(value)
+    local names = {}
+    if type(value) == "table" then
+        for _, item in ipairs(value) do
+            local name = as_text(item)
+            if name and name ~= "" then names[#names + 1] = name end
+        end
+        return names
+    end
+    local text = as_text(value)
+    if not text then return names end
+    for part in text:gmatch("[^;\n]+") do
+        local name = part:match("^%s*(.-)%s*$")
+        if name and name ~= "" then names[#names + 1] = name end
+    end
+    return names
+end
+
+-- Read the book size without loading the file.
+local function file_size(path)
+    local text = as_text(path)
+    if not text then return 0 end
+    local file = io.open(text, "rb")
+    if not file then return 0 end
+    local size = file:seek("end")
+    file:close()
+    return as_count(size) or 0
+end
+
+local function file_format(path)
+    local text = as_text(path)
+    if not text then return "" end
+    return (text:lower():match("%.([%w]+)$")) or ""
+end
+
+-- The deepest TOC entry at or before the page.
+local function chapter_from_toc(toc, page)
+    if type(toc) ~= "table" or not page then return nil end
+    local best, best_page = nil, nil
+    for _, entry in ipairs(toc) do
+        if type(entry) == "table" then
+            local title = as_text(entry.title)
+            local entry_page = as_count(entry.page)
+            if title and entry_page and entry_page <= page
+                    and (best_page == nil or entry_page >= best_page) then
+                best, best_page = title, entry_page
+            end
+        end
+    end
+    return best
+end
+
+-- One line of text, so a log entry cannot break into several lines.
+local function one_line(text)
+    if type(text) ~= "string" or text == "" then return "-" end
+    return (text:gsub("%s+", " "))
+end
+
+local function json_escape(text)
+    return (text:gsub('[%c"\\]', function(char)
+        if char == '"' then return '\\"' end
+        if char == '\\' then return '\\\\' end
+        if char == '\n' then return '\\n' end
+        if char == '\r' then return '\\r' end
+        if char == '\t' then return '\\t' end
+        return string.format('\\u%04x', char:byte())
+    end))
+end
+
+local function json_string(text)
+    return '"' .. json_escape(as_text(text) or "") .. '"'
+end
+
+local function json_number(value)
+    if type(value) ~= "number" then return "null" end
+    if value == math.floor(value) and math.abs(value) < 1e15 then
+        return string.format("%d", value)
+    end
+    local text = string.format("%.6f", value)
+    text = text:gsub("0+$", ""):gsub("%\\.$", "")
+    return text
+end
+
+-- Hand-written JSON for the one shape the daemon reads. A general table walker
+-- would be more code than the format needs.
+local function encode_context(context)
+    local book = context.book or {}
+    local pos = context.pos or {}
+    local locator = context.locator or {}
+    local authors = {}
+    for _, name in ipairs(book.authors or {}) do
+        authors[#authors + 1] = json_string(name)
+    end
+    local highlight = "null"
+    if as_text(context.highlight) and context.highlight ~= "" then
+        highlight = json_string(context.highlight)
+    end
+    return '{"v":1,"book":{' ..
+        '"title":' .. json_string(book.title) ..
+        ',"authors":[' .. table.concat(authors, ",") .. ']' ..
+        ',"size_bytes":' .. json_number(book.size_bytes or 0) ..
+        ',"partial_md5":' .. json_string(book.partial_md5) ..
+        ',"format":' .. json_string(book.format) ..
+        '},"pos":{' ..
+        '"page":' .. json_number(pos.page) ..
+        ',"total_pages":' .. json_number(pos.total_pages) ..
+        ',"fraction":' .. json_number(pos.fraction) ..
+        ',"chapter":' .. json_string(pos.chapter) ..
+        '},"locator":{' ..
+        '"xpointer":' .. json_string(locator.xpointer) ..
+        ',"href":' .. json_string(locator.href) ..
+        '},"highlight":' .. highlight .. '}'
+end
+
+-- The text fields that yield space when the payload is too long, in order.
+local function crop_fields(context)
+    return {
+        {
+            read = function() return context.highlight end,
+            write = function(text) context.highlight = text end,
+        },
+        {
+            read = function() return context.pos.chapter end,
+            write = function(text) context.pos.chapter = text end,
+        },
+        {
+            read = function() return context.book.title end,
+            write = function(text) context.book.title = text end,
+        },
+    }
+end
+
+-- Cut at or below limit bytes without splitting a UTF-8 sequence.
+local function utf8_prefix(text, limit)
+    if #text <= limit then return text end
+    local cut = math.max(0, limit)
+    while cut > 0 do
+        local byte = text:byte(cut + 1)
+        if not byte or byte < 0x80 or byte > 0xBF then break end
+        cut = cut - 1
+    end
+    return text:sub(1, cut)
+end
+
+-- Keep the encoded payload under max_bytes by shortening one field at a time.
+-- The highlight goes first, so a long selection never pushes the file over the
+-- header cap.
+local function fit_context(context, max_bytes)
+    local payload = encode_context(context)
+    if #payload <= max_bytes then return payload end
+    for _, field in ipairs(crop_fields(context)) do
+        local text = field.read()
+        if type(text) == "string" and text ~= "" then
+            field.write("")
+            if #encode_context(context) <= max_bytes then
+                -- Longest prefix that still fits. Escaping only adds bytes, so
+                -- the encoded length grows with the prefix.
+                local low, high = 0, #text
+                while low < high do
+                    local middle = math.floor((low + high + 1) / 2)
+                    field.write(utf8_prefix(text, middle))
+                    if #encode_context(context) <= max_bytes then
+                        low = middle
+                    else
+                        high = middle - 1
+                    end
+                end
+                field.write(utf8_prefix(text, low))
+                return encode_context(context)
+            end
+        end
+    end
+    return encode_context(context)
+end
+
+-- Text for the "Show reading context" probe.
+local function describe_context(context)
+    local book = context.book or {}
+    local pos = context.pos or {}
+    local locator = context.locator or {}
+    local authors = table.concat(book.authors or {}, ", ")
+    local fraction = "-"
+    if type(pos.fraction) == "number" then
+        fraction = string.format("%.3f", pos.fraction)
+    end
+    return table.concat({
+        _("Title: ") .. (book.title ~= "" and book.title or _("(none)")),
+        _("Authors: ") .. (authors ~= "" and authors or _("(none)")),
+        _("Page: ") .. tostring(pos.page or "-") .. _(" of ") ..
+            tostring(pos.total_pages or "-"),
+        _("Fraction: ") .. fraction,
+        _("Chapter: ") .. (pos.chapter ~= "" and pos.chapter or _("(none)")),
+        _("XPointer: ") ..
+            (locator.xpointer ~= "" and locator.xpointer or _("(none)")),
+        _("Highlight: ") .. (context.highlight and _("yes") or _("no")),
+    }, "\n")
+end
+
+-- One log line for the probe. The title is the only book text it carries.
+local function context_log_line(context)
+    local book = context.book or {}
+    local pos = context.pos or {}
+    local locator = context.locator or {}
+    local fraction = "-"
+    if type(pos.fraction) == "number" then
+        fraction = string.format("%.4f", pos.fraction)
+    end
+    return string.format("%s page=%s/%s fraction=%s chapter=%s xpointer=%s highlight=%s title=%s\n",
+        os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        tostring(pos.page or "-"), tostring(pos.total_pages or "-"), fraction,
+        one_line(pos.chapter), one_line(locator.xpointer),
+        context.highlight and "yes" or "no", one_line(book.title))
+end
+
+-- Close the highlight dialog through whichever hook this build has.
+local function close_highlight_dialog(highlight)
+    for _, name in ipairs({ "closeHighlightDialog", "clear" }) do
+        local close = highlight[name]
+        if type(close) == "function" then
+            pcall(close, highlight)
+            return true
+        end
+    end
+    return false
 end
 
 -- A strip along the bottom edge. It does not cover the page, so the reader
@@ -635,6 +852,162 @@ function VoiceBridge:manualPageOpen()
     return self.record_page ~= nil and not self.record_page.closed
 end
 
+-- Reading context for one ask. Returns nil when no document is open. Every
+-- getter is optional: a missing or raising API drops only its own field.
+function VoiceBridge:collectReadingContext()
+    local ui = self.ui
+    local document = ui and ui.document
+    if not document then return nil end
+
+    local page = as_count(attempt(function() return ui:getCurrentPage() end))
+    if not page then
+        page = as_count(attempt(function() return self.view.state.page end))
+    end
+    local total = as_count(attempt(function() return document:getPageCount() end))
+    local fraction = nil
+    if page and total and total > 0 then
+        fraction = page / total
+    end
+
+    local props = attempt(function() return document:getProps() end)
+    if type(props) ~= "table" then props = {} end
+    local path = attempt(function() return document.file end)
+
+    local chapter = as_text(attempt(function()
+        return ui.toc:getTocTitleOfCurrentPage()
+    end))
+    if not chapter then
+        chapter = as_text(attempt(function()
+            return chapter_from_toc(document:getTOC(), page)
+        end))
+    end
+
+    return {
+        v = 1,
+        book = {
+            title = as_text(props.title) or "",
+            authors = author_list(props.authors),
+            size_bytes = file_size(path),
+            partial_md5 = as_text(attempt(function()
+                return ui.doc_settings:readSetting("partial_md5_checksum")
+            end)) or "",
+            format = file_format(path),
+        },
+        pos = {
+            page = page,
+            total_pages = total,
+            fraction = fraction,
+            chapter = chapter or "",
+        },
+        locator = {
+            xpointer = as_text(attempt(function()
+                return document:getXPointer()
+            end)) or "",
+            -- Reserved: the daemon resolves the fraction, not the href.
+            href = "",
+        },
+        highlight = self:currentHighlight(),
+    }
+end
+
+-- The selection the highlight dialog holds right now.
+function VoiceBridge:liveSelection()
+    local text = as_text(attempt(function()
+        return self.ui.highlight.selected_text.text
+    end))
+    if text == "" then return nil end
+    return text
+end
+
+-- The text stashed by the highlight entry, else the live selection.
+function VoiceBridge:currentHighlight()
+    return as_text(self.selected_text) or self:liveSelection()
+end
+
+-- Write the context file the daemon reads. A failure returns false and must
+-- not block the ask. The context is cropped in place to fit the header cap.
+function VoiceBridge:writeReadingContext(context)
+    if type(context) ~= "table" then return false end
+    local payload = fit_context(context, context_max_bytes)
+    local file = io.open(self.context_path or context_path, "wb")
+    if not file then return false end
+    local written = file:write(payload)
+    local closed = file:close()
+    return written and closed and true or false
+end
+
+-- Probe: show what the daemon would receive and log one line.
+function VoiceBridge:showReadingContext()
+    local context = self:collectReadingContext()
+    if not context then
+        UIManager:show(InfoMessage:new{ text = _("Open a book first.") })
+        return
+    end
+    local file = io.open(self.context_log_path or context_log_path, "a")
+    if file then
+        file:write(context_log_line(context))
+        file:close()
+    end
+    UIManager:show(InfoMessage:new{ text = describe_context(context) })
+end
+
+-- The action behind the highlight entry: keep the quoted text for the ask,
+-- dismiss the dialog, then run the normal spoken ask.
+function VoiceBridge:askAboutSelection(highlight)
+    local text = as_text(attempt(function()
+        return highlight.selected_text.text
+    end))
+    self.selected_text = text or self:currentHighlight()
+    if highlight then close_highlight_dialog(highlight) end
+    self:startManualRecording()
+end
+
+-- Builds without addToHighlightDialog open the dialog themselves. Wrap the
+-- opener so the entry is appended to the list it returns.
+function VoiceBridge:wrapHighlightDialog(highlight)
+    local original = highlight.onShowHighlightDialog
+    highlight.onShowHighlightDialog = function(this, ...)
+        local dialog = original(this, ...)
+        if type(dialog) ~= "table" or dialog.text ~= nil then
+            -- Unknown shape: leave the dialog as the build made it.
+            return dialog
+        end
+        table.insert(dialog, {
+            text = _("Ask Voice Bridge"),
+            callback = function() self:askAboutSelection(this) end,
+        })
+        return dialog
+    end
+    return true
+end
+
+-- Register the highlight dialog entry. Both hooks are optional, so a build
+-- without them keeps the menu item and loses only the shortcut.
+function VoiceBridge:registerHighlightEntry()
+    local highlight = self.ui and self.ui.highlight
+    if type(highlight) ~= "table" then return false end
+    if type(highlight.addToHighlightDialog) == "function" then
+        return pcall(highlight.addToHighlightDialog, highlight,
+            highlight_entry_id, function(this)
+                return {
+                    text = _("Ask Voice Bridge"),
+                    callback = function() self:askAboutSelection(this) end,
+                }
+            end)
+    end
+    if type(highlight.onShowHighlightDialog) == "function" then
+        return self:wrapHighlightDialog(highlight)
+    end
+    return false
+end
+
+-- Menu entry: ask about the page, with the live selection when there is one
+-- and page-only context otherwise. A stale stashed selection is dropped.
+function VoiceBridge:askAboutPage()
+    self.selected_text = self:liveSelection()
+    self:startManualRecording()
+end
+
 function VoiceBridge:startManualRecording()
     if self:manualPageOpen() then
         UIManager:show(InfoMessage:new{
@@ -642,7 +1015,7 @@ function VoiceBridge:startManualRecording()
         })
         return
     end
-    local state = read_state()
+    local state = read_state(self.state_path)
     if not state then
         UIManager:show(InfoMessage:new{
             text = _("Start the Bluetooth session first. A session started by an older daemon has no state file; stop it and start it again."),
@@ -656,15 +1029,27 @@ function VoiceBridge:startManualRecording()
         return
     end
 
+    -- The context file is optional, so a write failure never blocks the ask.
+    local context = self:collectReadingContext()
+    if context then
+        pcall(self.writeReadingContext, self, context)
+    end
+    -- One ask uses one selection.
+    self.selected_text = nil
+
     -- The daemon polls this file every 100 ms. Starting a client process takes
     -- several seconds on the device, which is longer than the bar will wait.
-    if not write_command(command_path, "start_recording\n") then
+    if not write_command(self.command_path or command_path, "start_recording\n") then
         UIManager:show(InfoMessage:new{
             text = _("The plugin could not start the recording."),
         })
         return
     end
-    self.record_page = RecordPage:new{ phase = "waiting" }
+    self.record_page = RecordPage:new{
+        phase = "waiting",
+        state_path = self.state_path,
+        command_path = self.command_path,
+    }
     self.record_page:start()
 end
 
@@ -673,7 +1058,7 @@ function VoiceBridge:stopManualRecording()
         self.record_page:onTapStop()
         return
     end
-    local state = read_state()
+    local state = read_state(self.state_path)
     if not state then
         UIManager:show(InfoMessage:new{
             text = _("Start the Bluetooth session first. A session started by an older daemon has no state file; stop it and start it again."),
@@ -692,9 +1077,14 @@ function VoiceBridge:stopManualRecording()
         return
     end
     -- A recording is running that this plugin did not start. Take it over.
-    self.record_page = RecordPage:new{ phase = "stopping", stop_requested = true }
+    self.record_page = RecordPage:new{
+        phase = "stopping",
+        stop_requested = true,
+        state_path = self.state_path,
+        command_path = self.command_path,
+    }
     self.record_page:start()
-    if not write_command(command_path, "stop_recording\n") then
+    if not write_command(self.command_path or command_path, "stop_recording\n") then
         UIManager:show(InfoMessage:new{
             text = _("The plugin could not stop the recording."),
         })
@@ -707,7 +1097,7 @@ function VoiceBridge:toggleManualRecording()
         self.record_page:onTapStop()
         return
     end
-    local state = read_state()
+    local state = read_state(self.state_path)
     if state and state.phase ~= "idle" then
         self:stopManualRecording()
         return
@@ -765,6 +1155,14 @@ function VoiceBridge:addToMainMenu(menu_items)
             {
                 text = _("Ask question"),
                 callback = function() self:startManualRecording() end,
+            },
+            {
+                text = _("Ask about this page"),
+                callback = function() self:askAboutPage() end,
+            },
+            {
+                text = _("Show reading context"),
+                callback = function() self:showReadingContext() end,
             },
         },
     }

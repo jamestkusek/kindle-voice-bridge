@@ -1,12 +1,14 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "kindle-voice-bridge"
 version = "0.1.0"
-description = "Portable HTTP receiver for audio recordings sent from a Kindle voice bridge client."
+description = "Capture spoken questions on a jailbroken Kindle and return LLM answers."
 readme = "README.md"
+license = "MIT"
+authors = [{ name = "James Kusek" }]
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115,<1.0",
@@ -23,8 +25,12 @@ classifiers = [
 [project.optional-dependencies]
 hci = ["bumble==0.0.236"]
 test = [
-    "pytest>=8.0,<9.0",
+    "pytest>=8.0,<10.0",
+    # Starlette's TestClient imports httpx2 on Starlette 1.x and falls back to
+    # httpx on 0.x. FastAPI's own "standard" extra ships both for this reason,
+    # so pin both here and the suite runs on either Starlette line.
     "httpx>=0.27,<1.0",
+    "httpx2>=2.0,<3.0",
     # Runs the KOReader Lua spec (tests/koreader/voicebridge_spec.lua).
     # The suite skips that test when lupa is not installed.
     "lupa>=2.0,<3.0",
@@ -43,6 +49,6 @@ include = ["voice_bridge_server*"]
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests"]
-pythonpath = ["server"]
+pythonpath = ["server", "."]
 addopts = "-ra --strict-config"
 norecursedirs = [".git", ".venv", "venv", "build", "dist", "*.egg-info"]

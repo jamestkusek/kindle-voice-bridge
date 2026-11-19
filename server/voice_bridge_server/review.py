@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import pathlib
+import time
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request
@@ -34,13 +35,18 @@ from fastapi.responses import (
     Response,
 )
 
+from ._shell import page_headers, page_shell
 from .answers import answer_path, read_answer
 from .audio import WavError, parse_wav
 from .config import Settings
 from .storage import RECORDING_ID_PATTERN
+from .trace import TRACE_SUFFIX, TraceStore
 from .transcripts import read_sidecar, transcript_paths
 
 _SHA_PREFIX_CHARS = 12
+#: The reading context sidecar. The receiver writes it under this suffix (see
+#: ``app.context_path``), so the delete path has to look for the same name.
+_CONTEXT_SUFFIX = ".context.json"
 #: A sidecar is written by the receiver, but the page still caps what it will
 #: echo so a corrupt or hand-edited file cannot bloat the listing.
 _TRANSCRIPT_TEXT_LIMIT = 4000
@@ -110,6 +116,7 @@ def list_recordings(storage_dir: pathlib.Path) -> list[dict[str, object]]:
     except OSError:
         return []
 
+    traces = TraceStore(storage_dir)
     described: list[tuple[float, dict[str, object]]] = []
     for entry in entries:
         recording_id = entry.stem
@@ -121,7 +128,7 @@ def list_recordings(storage_dir: pathlib.Path) -> list[dict[str, object]]:
             # A symlink that resolves outside the storage directory is not a
             # recording this page may read.
             continue
-        described_item = _describe_recording(path, recording_id)
+        described_item = _describe_recording(path, recording_id, traces)
         if described_item is None:
             continue
         described.append(described_item)
@@ -132,13 +139,26 @@ def list_recordings(storage_dir: pathlib.Path) -> list[dict[str, object]]:
     return [item for _, item in described]
 
 
+def context_path(wav_path: pathlib.Path) -> pathlib.Path:
+    """Return the ``.context.json`` sidecar path for one recording."""
+
+    return wav_path.with_suffix(_CONTEXT_SUFFIX)
+
+
+def trace_path(wav_path: pathlib.Path) -> pathlib.Path:
+    """Return the ``.trace.json`` path for one recording."""
+
+    return wav_path.with_suffix(TRACE_SUFFIX)
+
+
 def delete_recording(
     storage_dir: pathlib.Path, recording_id: str
 ) -> None:
-    """Delete one stored recording and its sidecars, or raise a specific error.
+    """Delete one stored recording, its trace and its sidecars, or raise.
 
-    The transcript and answer sidecars belong to the recording, so leaving them
-    behind would accumulate orphaned files in the storage directory.
+    The transcript, answer, context and trace files all belong to the
+    recording, so leaving them behind would accumulate orphaned files in the
+    storage directory.
     """
 
     path = recording_path(storage_dir, recording_id)
@@ -149,13 +169,31 @@ def delete_recording(
     except OSError as exc:
         raise RecordingDeleteFailed(recording_id) from exc
 
-    for sidecar in (*transcript_paths(path), answer_path(path)):
+    sidecars = (
+        *transcript_paths(path),
+        answer_path(path),
+        context_path(path),
+        trace_path(path),
+    )
+    for sidecar in sidecars:
+        # The pipeline may be rewriting the trace while the delete runs.
+        # Windows reports that as a sharing violation, so retry briefly.
+        _unlink_with_retry(sidecar)
+
+
+def _unlink_with_retry(path: pathlib.Path, attempts: int = 10) -> None:
+    """Remove one file, retrying while Windows holds a sharing lock."""
+
+    for attempt in range(attempts):
         try:
-            sidecar.unlink()
+            path.unlink()
+            return
+        except FileNotFoundError:
+            return
         except OSError:
-            # The recording is already gone. A sidecar that cannot be removed
-            # is not a reason to report the delete as failed.
-            pass
+            if attempt == attempts - 1:
+                return
+            time.sleep(0.02)
 
 
 def register_review_routes(app: FastAPI, settings: Settings) -> None:
@@ -166,19 +204,12 @@ def register_review_routes(app: FastAPI, settings: Settings) -> None:
     @app.get("/", include_in_schema=False)
     def review_page() -> HTMLResponse:
         return HTMLResponse(
-            _REVIEW_PAGE_HTML,
-            headers={
-                "Cache-Control": "no-store",
-                "X-Content-Type-Options": "nosniff",
-                "X-Frame-Options": "DENY",
-                "Referrer-Policy": "no-referrer",
-                "Content-Security-Policy": (
-                    "default-src 'none'; style-src 'unsafe-inline'; "
-                    "script-src 'unsafe-inline'; media-src 'self'; "
-                    "connect-src 'self'; base-uri 'none'; form-action 'none'; "
-                    "frame-ancestors 'none'"
-                ),
-            },
+            page_shell(
+                "Kindle Voice LLM Interface",
+                _REVIEW_BODY,
+                head=_REVIEW_STYLE,
+            ),
+            headers=page_headers(),
         )
 
     @app.get("/api/recordings", include_in_schema=False)
@@ -249,8 +280,31 @@ def register_review_routes(app: FastAPI, settings: Settings) -> None:
         )
 
 
+def _trace_summary(
+    traces: TraceStore, recording_id: str
+) -> dict[str, object] | None:
+    """Return the origin and outcome of one trace, or ``None``.
+
+    The listing only advertises the trace, so the page can link to the debug
+    panel and mark a dev ask. The debug page reads the whole trace itself.
+    """
+
+    try:
+        trace = traces.read(recording_id)
+    except ValueError:
+        return None
+    if trace is None:
+        return None
+    origin = trace.get("origin")
+    outcome = trace.get("outcome")
+    return {
+        "origin": origin if isinstance(origin, str) else "",
+        "outcome": outcome if isinstance(outcome, str) else "",
+    }
+
+
 def _describe_recording(
-    path: pathlib.Path, recording_id: str
+    path: pathlib.Path, recording_id: str, traces: TraceStore
 ) -> tuple[float, dict[str, object]] | None:
     try:
         stat = path.stat()
@@ -279,6 +333,7 @@ def _describe_recording(
         "parse_error": None,
         "transcript": _transcript_summary(path),
         "answer": _answer_summary(path),
+        "trace": _trace_summary(traces, recording_id),
     }
 
     try:
@@ -378,13 +433,7 @@ def _error_response(
     )
 
 
-_REVIEW_PAGE_HTML = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Kindle Voice LLM Interface</title>
-<style>
+_REVIEW_STYLE = """<style>
 :root {
   color-scheme: light dark;
   --bg: #f5f6f8;
@@ -518,10 +567,22 @@ summary:hover { color: var(--accent); }
   font-size: 0.8rem;
 }
 .empty { color: var(--muted); text-align: center; padding: 2rem 0; }
+.chips { margin: 0.25rem 0 0; }
+.chips:empty { display: none; }
+.chip {
+  display: inline-block;
+  padding: 0 0.4rem;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
 </style>
-</head>
-<body>
-<header>
+"""
+
+_REVIEW_BODY = """<header>
   <h1>Kindle Voice LLM Interface</h1>
   <div class="actions">
     <span id="status" role="status" aria-live="polite"></span>
@@ -711,6 +772,21 @@ summary:hover { color: var(--accent); }
     return download ? url + "?download=1" : url;
   }
 
+  function traceUrl(id) {
+    return "/debug#" + encodeURIComponent(id);
+  }
+
+  // The chip marks an ask that the debug page started, so a dev run is never
+  // mistaken for a spoken question.
+  function fillChips(container, item) {
+    container.replaceChildren();
+    if (!item.trace || item.trace.origin !== "dev") return;
+    var chip = document.createElement("span");
+    chip.className = "chip";
+    chip.textContent = "dev";
+    container.append(chip);
+  }
+
   function fillSections(container, item) {
     container.replaceChildren();
     if (item.parse_error) {
@@ -790,6 +866,10 @@ summary:hover { color: var(--accent); }
     received.className = "received";
     received.textContent = "Received " + formatTime(item.received_at);
     identity.append(received);
+    var chips = document.createElement("p");
+    chips.className = "chips";
+    fillChips(chips, item);
+    identity.append(chips);
     head.append(identity);
 
     var remove = document.createElement("button");
@@ -819,12 +899,19 @@ summary:hover { color: var(--accent); }
     download.textContent = "Download";
     card.append(download);
 
+    var trace = document.createElement("a");
+    trace.className = "download";
+    trace.href = traceUrl(item.id);
+    trace.textContent = "Trace";
+    card.append(trace);
+
     var details = buildDetails(item);
     card.append(details);
 
     return {
       card: card,
       received: received,
+      chips: chips,
       sections: sections,
       details: details,
       signature: JSON.stringify(item),
@@ -833,6 +920,7 @@ summary:hover { color: var(--accent); }
 
   function updateCard(entry, item) {
     entry.received.textContent = "Received " + formatTime(item.received_at);
+    fillChips(entry.chips, item);
     fillSections(entry.sections, item);
     fillDetails(entry.details, item);
     entry.signature = JSON.stringify(item);
@@ -962,6 +1050,4 @@ summary:hover { color: var(--accent); }
   load();
 })();
 </script>
-</body>
-</html>
 """

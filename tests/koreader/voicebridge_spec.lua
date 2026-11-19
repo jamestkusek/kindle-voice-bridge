@@ -4,7 +4,9 @@
 -- rewrites every 100 ms. This spec stubs the KOReader modules that main.lua
 -- requires, loads the plugin, and drives RecordPage through the state machine
 -- with a state file it writes itself. It never touches a Kindle, Bluetooth, or
--- the real control socket.
+-- the real control socket. The second half covers the reading context
+-- collector, its JSON payload and the highlight dialog entry, with a fake ui
+-- and a context file in the same temporary directory.
 --
 -- Run it with any Lua 5.1+ interpreter:
 --
@@ -142,7 +144,9 @@ local source = assert(io.open(PLUGIN, "r"), "cannot open " .. PLUGIN):read("*a")
 -- spec can reach the locals it needs without changing the shipped file.
 local patched, replaced = source:gsub("\nreturn VoiceBridge%s*$",
     "\nreturn { VoiceBridge = VoiceBridge, RecordPage = RecordPage, " ..
-    "read_state = read_state }")
+    "read_state = read_state, encode_context = encode_context, " ..
+    "fit_context = fit_context, context_path = context_path, " ..
+    "context_log_path = context_log_path }")
 assert(replaced == 1, "the plugin does not end with `return VoiceBridge`")
 local load_chunk = loadstring or load
 local chunk = assert(load_chunk(patched, PLUGIN))
@@ -343,11 +347,310 @@ equal(message.text, "It is a cloud.", "the popup shows the answer")
 message.dismiss_callback()
 check(page.closed, "closing the popup closes the bar")
 
+-- Reading context ----------------------------------------------------------
+
+local CONTEXT = STATE .. ".context.json"
+local CONTEXT_LOG = STATE .. ".context.log"
+local ASK_COMMAND = STATE .. ".ask.cmd"
+local BOOK = STATE .. ".book.epub"
+
+local function new_ui(options)
+    options = options or {}
+    local ui = {
+        document = options.document,
+        doc_settings = options.doc_settings,
+        toc = options.toc,
+        highlight = options.highlight,
+        page = options.page,
+        menu = {
+            registerToMainMenu = function(self, plugin) self.plugin = plugin end,
+        },
+    }
+    ui.getCurrentPage = function() return ui.page end
+    return ui
+end
+
+-- Each getter exists only when the test supplies it, so a missing API and a
+-- raising API are both reachable.
+local function new_document(options)
+    options = options or {}
+    return {
+        file = options.file,
+        getProps = options.props and function() return options.props end,
+        getPageCount = options.page_count and function() return options.page_count end,
+        getXPointer = options.xpointer and function() return options.xpointer end,
+        getTOC = options.toc and function() return options.toc end,
+    }
+end
+
+local function read_text(path)
+    local handle = io.open(path, "r")
+    if not handle then return nil end
+    local text = handle:read("*a")
+    handle:close()
+    return text
+end
+
+local function contains(haystack, needle)
+    return haystack ~= nil and haystack:find(needle, 1, true) ~= nil
+end
+
+-- 16. No open document means no context, and no error.
+local no_book = exports.VoiceBridge:new{ ui = new_ui{} }
+check(no_book:collectReadingContext() == nil,
+    "collectReadingContext returns nil without a document")
+check(no_book:writeReadingContext(nil) == false,
+    "writeReadingContext refuses a missing context")
+
+-- 17. Every getter feeds one context, and the payload is the daemon shape.
+local book = assert(io.open(BOOK, "w"))
+book:write("0123456")
+book:close()
+
+local reader_ui = new_ui{
+    document = new_document{
+        file = BOOK,
+        props = {
+            title = 'Rain "and" \\ Snow',
+            authors = "Ursula K. Le Guin; Kim Stanley Robinson",
+        },
+        page_count = 10,
+        xpointer = "!/body/DocFragment[3]/body/div/p[1]",
+    },
+    doc_settings = {
+        readSetting = function(_, key)
+            if key == "partial_md5_checksum" then return "abc123" end
+        end,
+    },
+    toc = { getTocTitleOfCurrentPage = function() return "Chapter\nTwo" end },
+    page = 3,
+}
+local ask = exports.VoiceBridge:new{
+    ui = reader_ui,
+    context_path = CONTEXT,
+    context_log_path = CONTEXT_LOG,
+}
+local context = ask:collectReadingContext()
+check(context ~= nil, "a document yields a context")
+equal(context.book.title, 'Rain "and" \\ Snow', "the title comes from the props")
+equal(context.book.authors[1], "Ursula K. Le Guin", "authors are split on the semicolon")
+equal(context.book.authors[2], "Kim Stanley Robinson", "the second author is kept")
+equal(context.book.size_bytes, 7, "the size comes from the book file")
+equal(context.book.partial_md5, "abc123", "the partial md5 comes from the settings")
+equal(context.book.format, "epub", "the format comes from the suffix")
+equal(context.pos.page, 3, "the page comes from the ui")
+equal(context.pos.total_pages, 10, "the total comes from the document")
+equal(context.pos.fraction, 0.3, "the fraction is page over total")
+equal(context.pos.chapter, "Chapter\nTwo", "the chapter comes from the toc")
+equal(context.locator.xpointer, "!/body/DocFragment[3]/body/div/p[1]",
+    "the xpointer comes from the document")
+check(context.highlight == nil, "no selection means no highlight")
+
+local payload = exports.encode_context(context)
+check(contains(payload, '"v":1'), "the payload carries the version")
+check(contains(payload, '"title":"Rain \\"and\\" \\\\ Snow"'),
+    "quotes and backslashes are escaped")
+check(contains(payload, '"chapter":"Chapter\\nTwo"'), "the newline is escaped")
+check(contains(payload, '"page":3'), "the page is a number")
+check(contains(payload, '"fraction":0.3'), "the fraction is a number")
+check(contains(payload, '"highlight":null'), "an absent highlight is null")
+check(contains(payload, '"locator":{"xpointer":'),
+    "the locator section is present")
+
+-- 18. Control characters are escaped, not written raw.
+local escaped = exports.encode_context{
+    v = 1,
+    book = { title = "T", authors = {}, size_bytes = 0, partial_md5 = "", format = "epub" },
+    pos = { page = 1, total_pages = 2, fraction = 0.5, chapter = "" },
+    locator = { xpointer = "", href = "" },
+    highlight = 'a\1b\tc"d\\e',
+}
+check(contains(escaped, "\\u0001"), "a control character is escaped")
+check(contains(escaped, "\\t"), "a tab is escaped")
+check(contains(escaped, '\\"d'), "an inner quote is escaped")
+check(contains(escaped, "\\\\e"), "an inner backslash is escaped")
+
+-- 19. A long selection is cropped so the file stays under the byte budget.
+local long_text = string.rep("\195\169", 2000)  -- 4000 bytes of two-byte characters
+local long_context = {
+    v = 1,
+    book = { title = "Book", authors = {}, size_bytes = 0, partial_md5 = "", format = "epub" },
+    pos = { page = 1, total_pages = 2, fraction = 0.5, chapter = "" },
+    locator = { xpointer = "", href = "" },
+    highlight = long_text,
+}
+local fitted = exports.fit_context(long_context, 2500)
+check(#fitted <= 2500, "the fitted payload fits the byte budget")
+check(#long_context.highlight > 0, "the highlight keeps a prefix")
+equal(long_text:sub(1, #long_context.highlight), long_context.highlight,
+    "the kept text is a prefix of the selection")
+-- A cut is clean when the next byte starts a character, not continues one.
+local after = long_text:byte(#long_context.highlight + 1)
+check(after == nil or after < 0x80 or after > 0xBF,
+    "the cut falls on a UTF-8 boundary")
+equal(#long_context.highlight % 2, 0, "the kept text holds whole characters")
+check(ask:writeReadingContext(long_context), "writeReadingContext reports success")
+local stored = read_text(CONTEXT)
+check(stored ~= nil, "the context file is written")
+check(#stored <= 2500, "the context file stays under the byte budget")
+check(contains(stored, '"highlight":"'), "the cropped highlight is kept")
+
+-- 20. The ask writes the context before the start command, and the bar opens.
+publish("idle", -1, -1, "connected", "-")
+os.remove(ASK_COMMAND)
+ask.state_path = STATE
+ask.command_path = ASK_COMMAND
+ask:startManualRecording()
+local ask_payload = read_text(CONTEXT)
+check(contains(ask_payload, '"title":"Rain'),
+    "startManualRecording writes the context file")
+check(contains(ask_payload, '"page":3'), "the context file carries the page")
+local command = io.open(ASK_COMMAND, "r")
+check(command ~= nil, "startManualRecording writes the start command")
+if command then
+equal(command:read("*l"), "start_recording", "the start command is written")
+command:close()
+end
+check(ask:manualPageOpen(), "the recording bar is shown")
+
+-- 21. A context file that cannot be written does not block the ask.
+os.remove(ASK_COMMAND)
+local blocked = exports.VoiceBridge:new{
+    ui = reader_ui,
+    state_path = STATE,
+    command_path = ASK_COMMAND,
+    context_path = STATE .. ".missing-dir/context.json",
+}
+blocked:startManualRecording()
+check(read_text(ASK_COMMAND) ~= nil, "the ask still starts without a context file")
+
+-- 22. The probe shows the fields and appends one log line.
+local shown = #UIManager.shown
+ask:showReadingContext()
+equal(#UIManager.shown, shown + 1, "the probe shows one message")
+local probe = UIManager.shown[#UIManager.shown].widget
+check(contains(probe.text, "Title: Rain"), "the probe shows the title")
+check(contains(probe.text, "Authors: Ursula K. Le Guin"), "the probe shows the authors")
+check(contains(probe.text, "Page: 3 of 10"), "the probe shows the page")
+check(contains(probe.text, "Fraction: 0.300"), "the probe shows the fraction")
+check(contains(probe.text, "Chapter: Chapter"), "the probe shows the chapter")
+check(contains(probe.text, "XPointer: !/body"), "the probe shows the xpointer")
+check(contains(probe.text, "Highlight: no"), "the probe reports no highlight")
+local log = read_text(CONTEXT_LOG)
+check(log ~= nil, "the probe appends to the context log")
+check(contains(log, "page=3/10"), "the log line carries the page")
+check(contains(log, "highlight=no"), "the log line carries the highlight flag")
+check(not contains(log, "\n\n"), "the log line is one line per probe")
+
+-- 23. Each getter is optional: a raising or missing API drops one field.
+local broken_ui = new_ui{
+    document = { getProps = function() error("no props on this build") end },
+    page = 5,
+}
+local degraded = exports.VoiceBridge:new{ ui = broken_ui }
+local partial = degraded:collectReadingContext()
+check(partial ~= nil, "a partial document still yields a context")
+equal(partial.book.title, "", "a raising getProps drops only the title")
+equal(partial.pos.page, 5, "the page still comes from the ui")
+check(partial.pos.total_pages == nil, "a missing getPageCount drops the total")
+check(partial.pos.fraction == nil, "no fraction without a total")
+equal(partial.locator.xpointer, "", "a missing getXPointer drops the xpointer")
+equal(partial.book.size_bytes, 0, "a missing file drops the size")
+equal(partial.book.format, "", "a missing file drops the format")
+check(contains(exports.encode_context(partial), '"total_pages":null'),
+    "an unknown total encodes as null")
+
+degraded.view = { state = { page = 7 } }
+local fallback = new_ui{ document = broken_ui.document }
+check(fallback:getCurrentPage() == nil, "the fallback ui has no page getter")
+degraded.ui = fallback
+equal(degraded:collectReadingContext().pos.page, 7,
+    "the view state supplies the page when the ui does not")
+
+-- 24. The highlight entry stashes the text, closes the dialog and asks.
+local highlight = {
+    selected_text = { text = "It was a bright cold day in April." },
+    cleared = 0,
+}
+highlight.clear = function(self) self.cleared = self.cleared + 1 end
+highlight.addToHighlightDialog = function(self, id, get_button)
+    self.entry_id = id
+    self.button = get_button(self)
+end
+reader_ui.highlight = highlight
+local asked = 0
+local entry = exports.VoiceBridge:new{ ui = reader_ui, context_path = CONTEXT .. ".hl" }
+entry.startManualRecording = function() asked = asked + 1 end
+equal(highlight.entry_id, "voicebridge_ask", "the entry is registered once")
+check(highlight.button ~= nil, "the dialog receives one button")
+equal(highlight.button.text, "Ask Voice Bridge", "the button names the action")
+highlight.button.callback()
+equal(entry.selected_text, "It was a bright cold day in April.",
+    "the selection is stashed for the ask")
+equal(highlight.cleared, 1, "the dialog is closed")
+equal(asked, 1, "the normal ask starts")
+equal(entry:collectReadingContext().highlight, "It was a bright cold day in April.",
+    "the stashed selection becomes the highlight")
+
+-- 25. A build without addToHighlightDialog gets the wrapped opener instead.
+local legacy = {
+    selected_text = { text = "legacy selection" },
+    onShowHighlightDialog = function()
+        return { { text = "Highlight", callback = function() end } }
+    end,
+}
+local legacy_asked = 0
+local legacy_ui = new_ui{ document = reader_ui.document, page = 3, highlight = legacy }
+local legacy_entry = exports.VoiceBridge:new{ ui = legacy_ui }
+legacy_entry.startManualRecording = function() legacy_asked = legacy_asked + 1 end
+local buttons = legacy.onShowHighlightDialog(legacy)
+equal(#buttons, 2, "the wrapped opener appends one entry")
+equal(buttons[2].text, "Ask Voice Bridge", "the appended entry names the action")
+buttons[2].callback()
+equal(legacy_entry.selected_text, "legacy selection",
+    "the wrapped entry stashes the selection")
+equal(legacy_asked, 1, "the wrapped entry starts the ask")
+
+-- 26. A build with no highlight hooks is a supported configuration.
+local plain = exports.VoiceBridge:new{ ui = new_ui{ document = reader_ui.document, page = 3 } }
+check(plain:registerHighlightEntry() == false, "no hooks is not an error")
+local menu = {}
+plain:addToMainMenu(menu)
+local texts = {}
+for _, item in ipairs(menu.voicebridge.sub_item_table) do
+    texts[#texts + 1] = item.text
+end
+local joined = table.concat(texts, "|")
+check(contains(joined, "Ask about this page"), "the page entry is always offered")
+check(contains(joined, "Show reading context"), "the probe entry is always offered")
+
+local page_asked = 0
+local page_entry = exports.VoiceBridge:new{ ui = new_ui{ document = reader_ui.document, page = 3 } }
+page_entry.startManualRecording = function() page_asked = page_asked + 1 end
+page_entry.selected_text = "stale selection from an earlier ask"
+page_entry:askAboutPage()
+equal(page_asked, 1, "the page entry starts the ask")
+check(page_entry.selected_text == nil,
+    "a page-only ask drops a stale selection")
+
+os.remove(CONTEXT)
+os.remove(CONTEXT .. ".hl")
+os.remove(CONTEXT_LOG)
+os.remove(ASK_COMMAND)
+os.remove(BOOK)
 os.remove(STATE)
 os.remove(STATE .. ".bad")
 
 if failures > 0 then
     io.stderr:write(string.format("%d of %d checks failed\n", failures, checks))
-    os.exit(1)
 end
 print(string.format("%d checks passed", checks))
+
+-- Under pytest the wrapper reads this table and asserts on it, so a failing
+-- check produces a normal test failure instead of aborting the whole run.
+-- A standalone `lua tests/koreader/voicebridge_spec.lua` still exits non-zero.
+local summary = { failures = failures, checks = checks }
+if os.getenv("VOICEBRIDGE_SPEC_REPORT") ~= "1" and failures > 0 then
+    os.exit(1)
+end
+return summary

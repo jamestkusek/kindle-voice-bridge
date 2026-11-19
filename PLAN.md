@@ -136,4 +136,4 @@ Select a suitable provider with the user and deploy the same application where s
 - [kindle-hid-passthrough](https://github.com/zampierilucas/kindle-hid-passthrough) — controller handover reference; HID, not microphone capture
 - [kindle8-offline-home](https://github.com/yzgpk2002/kindle8-offline-home) — HFP capture reference tested on a different model
 - [Google Bumble](https://github.com/google/bumble) — userspace Bluetooth stack
-- Existing research: `../kindle-bt-mic-streaming-research.md`; its older streaming and provider assumptions are not the current plan.
+- Existing research: [docs/research/bluetooth-mic-feasibility.md](docs/research/bluetooth-mic-feasibility.md); its older streaming and provider assumptions are not the current plan.

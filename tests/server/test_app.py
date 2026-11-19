@@ -14,6 +14,7 @@ import functools
 import hashlib
 import json
 import logging
+import os
 import pathlib
 import re
 import shutil
@@ -883,6 +884,295 @@ def test_storage_failure_returns_500_and_leaves_no_artifacts(
     assert RECORDING_ID_RE.fullmatch(recording_id)
     assert received == body
     _assert_no_artifacts(settings.storage_dir)
+
+
+# ---------------------------------------------------------------------------
+# Reading context header
+# ---------------------------------------------------------------------------
+
+
+def _context_payload(**overrides) -> dict:
+    payload = {
+        "v": 1,
+        "book": {
+            "title": "The Dispossessed",
+            "authors": ["Ursula K. Le Guin"],
+            "size_bytes": 1024,
+            "partial_md5": "abc",
+            "format": "epub",
+        },
+        "pos": {
+            "page": 142,
+            "total_pages": 310,
+            "fraction": 0.43,
+            "chapter": "3",
+        },
+        "locator": {"xpointer": "", "href": ""},
+        "highlight": None,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _context_header(payload: dict) -> str:
+    body = json.dumps(payload).encode("utf-8")
+    return base64.urlsafe_b64encode(body).decode("ascii").rstrip("=")
+
+
+def _read_json(path: pathlib.Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _trace(settings: Settings, recording_id: str) -> dict:
+    return _read_json(settings.storage_dir / f"{recording_id}.trace.json")
+
+
+def _context_sidecar(settings: Settings, recording_id: str) -> dict:
+    return _read_json(settings.storage_dir / f"{recording_id}.context.json")
+
+
+def test_upload_without_a_context_header_writes_no_context_sidecar(
+    client: TestClient,
+    settings: Settings,
+) -> None:
+    response = client.post(URL, content=_wav(frames=100), headers=_headers())
+
+    assert response.status_code == 201
+    recording_id = response.json()["id"]
+    assert not (settings.storage_dir / f"{recording_id}.context.json").exists()
+    trace = _trace(settings, recording_id)
+    assert trace["origin"] == "kindle"
+    assert trace["context"] == {
+        "header_bytes": 0,
+        "parsed": {},
+        "rejected_reason": None,
+    }
+    assert [stage["name"] for stage in trace["stages"]] == [
+        "receive",
+        "validate",
+        "store",
+        "context",
+    ]
+
+
+def test_a_valid_context_header_is_stored_and_traced(
+    client: TestClient,
+    settings: Settings,
+) -> None:
+    payload = _context_payload()
+
+    response = client.post(
+        URL,
+        content=_wav(frames=100),
+        headers=_headers(**{"X-KVB-Context": _context_header(payload)}),
+    )
+
+    assert response.status_code == 201
+    recording_id = response.json()["id"]
+    sidecar = _context_sidecar(settings, recording_id)
+    assert sidecar["schema"] == "v1"
+    assert sidecar["status"] == "ok"
+    assert sidecar["parsed"] == payload
+
+    trace = _trace(settings, recording_id)
+    assert trace["context"]["parsed"]["book"]["title"] == "The Dispossessed"
+    assert trace["context"]["rejected_reason"] is None
+    assert trace["context"]["header_bytes"] > 0
+    # No resolver is configured, so the ask is recorded as having no library.
+    assert trace["resolve"]["rung"] == "none"
+    assert trace["resolve"]["reason"] == "no-library"
+    assert "resolve" in [stage["name"] for stage in trace["stages"]]
+
+
+def _synced_book(library_dir: pathlib.Path, paragraphs: list[str]) -> str:
+    """Write one complete book folder and return its key."""
+
+    from voice_bridge_server.context import book_key
+
+    title, authors = "The Dispossessed", ["Ursula K. Le Guin"]
+    key = book_key({"title": title, "authors": authors})
+    directory = library_dir / key
+    directory.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "key": key,
+        "title": title,
+        "authors": authors,
+        "aliases": [],
+        "chars": sum(len(paragraph) for paragraph in paragraphs),
+    }
+    (directory / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    offsets: list[int] = []
+    total = 0
+    for paragraph in paragraphs:
+        offsets.append(total)
+        total += len(paragraph)
+    text = {"paragraphs": paragraphs, "cum_chars": offsets}
+    (directory / "text.json").write_text(json.dumps(text), encoding="utf-8")
+    return key
+
+
+def test_an_upload_with_a_synced_book_passes_a_book_search(
+    tmp_path: pathlib.Path,
+) -> None:
+    from voice_bridge_server.app import _library_resolver
+    from voice_bridge_server.library import Library
+
+    library_dir = tmp_path / "library"
+    key = _synced_book(
+        library_dir,
+        [
+            "She walked the dusty road down to the port.",
+            "He spoke of the thunderhead and the wall.",
+        ],
+    )
+    seen: dict[str, object] = {}
+
+    def answer(path, transcript, book_search=None, trace=None, trace_store=None):
+        seen["book_search"] = book_search
+        seen["trace"] = trace
+
+    settings = Settings(
+        token=TOKEN, storage_dir=tmp_path / "recordings", library_dir=library_dir
+    )
+    app = create_app(
+        settings,
+        transcribe=lambda path: {"status": "ok", "text": "What is a thunderhead?"},
+        answer=answer,
+        resolve=_library_resolver(Library(library_dir)),
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            URL,
+            content=_wav(frames=100),
+            headers=_headers(**{"X-KVB-Context": _context_header(_context_payload())}),
+        )
+
+    assert response.status_code == 201
+    assert callable(seen["book_search"])
+    hits = seen["book_search"]("thunderhead")
+    assert [hit["index"] for hit in hits] == [1]
+
+    trace = _trace(settings, response.json()["id"])
+    assert trace["book"] == {"key": key, "match": "title+size"}
+    assert trace["resolve"]["rung"] == "fraction"
+
+
+def test_an_upload_without_a_synced_book_passes_no_book_search(
+    tmp_path: pathlib.Path,
+) -> None:
+    from voice_bridge_server.app import _library_resolver
+    from voice_bridge_server.library import Library
+
+    library_dir = tmp_path / "library"
+    library_dir.mkdir(parents=True, exist_ok=True)
+    seen: dict[str, object] = {}
+
+    def answer(path, transcript, book_search=None, trace=None, trace_store=None):
+        seen["book_search"] = book_search
+
+    settings = Settings(
+        token=TOKEN, storage_dir=tmp_path / "recordings", library_dir=library_dir
+    )
+    app = create_app(
+        settings,
+        transcribe=lambda path: {"status": "ok", "text": "What is a thunderhead?"},
+        answer=answer,
+        resolve=_library_resolver(Library(library_dir)),
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            URL,
+            content=_wav(frames=100),
+            headers=_headers(**{"X-KVB-Context": _context_header(_context_payload())}),
+        )
+
+    assert response.status_code == 201
+    assert seen["book_search"] is None
+
+
+def test_an_invalid_base64_header_never_rejects_the_upload(
+    client: TestClient,
+    settings: Settings,
+) -> None:
+    response = client.post(
+        URL,
+        content=_wav(frames=100),
+        headers=_headers(**{"X-KVB-Context": "not base64 at all!"}),
+    )
+
+    assert response.status_code == 201
+    recording_id = response.json()["id"]
+    assert _context_sidecar(settings, recording_id) == {
+        "schema": "v1",
+        "status": "invalid",
+        "reason": "bad_base64",
+    }
+    trace = _trace(settings, recording_id)
+    assert trace["context"]["rejected_reason"] == "bad_base64"
+    assert trace["context"]["parsed"] == {}
+    stage = next(item for item in trace["stages"] if item["name"] == "context")
+    assert stage["outcome"] == "rejected"
+    assert trace["outcome"] == "ok"
+
+
+def test_an_oversized_context_header_never_rejects_the_upload(
+    client: TestClient,
+    settings: Settings,
+) -> None:
+    # Base64 text that would decode to more than the 4096 byte header cap.
+    oversized = "A" * 6000
+
+    response = client.post(
+        URL,
+        content=_wav(frames=100),
+        headers=_headers(**{"X-KVB-Context": oversized}),
+    )
+
+    assert response.status_code == 201
+    recording_id = response.json()["id"]
+    assert _context_sidecar(settings, recording_id) == {
+        "schema": "v1",
+        "status": "invalid",
+        "reason": "too_large",
+    }
+    assert _trace(settings, recording_id)["context"]["rejected_reason"] == "too_large"
+
+
+def test_the_context_sidecar_is_written_privately(
+    client: TestClient,
+    settings: Settings,
+) -> None:
+    response = client.post(
+        URL,
+        content=_wav(frames=100),
+        headers=_headers(**{"X-KVB-Context": _context_header(_context_payload())}),
+    )
+
+    recording_id = response.json()["id"]
+    sidecar = settings.storage_dir / f"{recording_id}.context.json"
+    if os.name != "nt":
+        assert sidecar.stat().st_mode & 0o777 == 0o600
+    # No temporary file is left behind.
+    assert list(settings.storage_dir.glob(".context-*.part")) == []
+
+
+def test_a_malformed_json_header_never_rejects_the_upload(
+    client: TestClient,
+    settings: Settings,
+) -> None:
+    encoded = base64.urlsafe_b64encode(b"not json").decode("ascii").rstrip("=")
+
+    response = client.post(
+        URL,
+        content=_wav(frames=100),
+        headers=_headers(**{"X-KVB-Context": encoded}),
+    )
+
+    assert response.status_code == 201
+    recording_id = response.json()["id"]
+    assert _context_sidecar(settings, recording_id)["reason"] == "bad_json"
 
 
 # ---------------------------------------------------------------------------

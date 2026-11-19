@@ -14,16 +14,23 @@ the HTTP call and knows nothing about the filesystem. Both the receiver's
 background hook and ``tools/transcribe_worker.py`` call
 :func:`transcribe_recording`, so there is one implementation of the retry and
 sidecar rules.
+
+An optional :class:`voice_bridge_server.trace.TraceStore` records one
+``transcribe`` stage per attempt. The trace is observability only, so
+:func:`trace_safely` never lets a trace write failure reach the ask pipeline.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import pathlib
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 
+from .trace import TraceStore
 from .transcribe import (
     DEFAULT_MODEL,
     PermanentError,
@@ -33,6 +40,22 @@ from .transcribe import (
 
 DEFAULT_TIMEOUT_SECONDS = 90.0
 DEFAULT_MAX_ATTEMPTS = 3
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
+
+
+def trace_safely(action: Callable[[], object]) -> None:
+    """Run one trace write. A trace failure never reaches the ask pipeline.
+
+    The warning carries the exception type only. A trace holds the prompt and
+    the passage, so neither the message nor the arguments are logged.
+    """
+
+    try:
+        action()
+    except Exception as error:
+        logger.warning("trace_error type=%s", type(error).__name__)
 
 
 def utc_now() -> str:
@@ -91,12 +114,18 @@ def transcribe_recording(
     model: str = DEFAULT_MODEL,
     transport=None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    trace: str | None = None,
+    trace_store: TraceStore | None = None,
 ) -> dict:
     """Transcribe one file and write its sidecars. Returns the sidecar data.
 
     A failure is recorded in the sidecar rather than raised, so a caller that
     must not fail (the receiver's upload path) can call this directly. The
     ``retryable`` field says whether the failure was transient.
+
+    ``trace`` is a recording id and ``trace_store`` its
+    :class:`voice_bridge_server.trace.TraceStore`. Both must be set for the
+    ``transcribe`` stage to be recorded.
     """
 
     previous = read_sidecar(wav_path) or {}
@@ -104,45 +133,70 @@ def transcribe_recording(
     attempts = attempts + 1 if isinstance(attempts, int) else 1
     started = time.monotonic()
 
+    def finish(
+        data: dict, *, outcome: str = "ok", detail: dict | None = None
+    ) -> dict:
+        """Record the one transcribe stage, then write the sidecars."""
+
+        if trace is not None and trace_store is not None:
+            duration_ms = round((time.monotonic() - started) * 1000.0, 3)
+            trace_safely(
+                lambda: trace_store.stage(
+                    trace,
+                    "transcribe",
+                    outcome=outcome,
+                    detail=detail,
+                    duration_ms=duration_ms,
+                )
+            )
+        write_sidecars(wav_path, data)
+        return data
+
     try:
         wav_bytes = wav_path.read_bytes()
     except OSError as error:
-        data = {
-            "status": "error",
-            "text": "",
-            "attempts": attempts,
-            "error": f"The recording could not be read: {error.strerror or error}.",
-            "retryable": False,
-            "updated_at": utc_now(),
-        }
-        write_sidecars(wav_path, data)
-        return data
+        return finish(
+            {
+                "status": "error",
+                "text": "",
+                "attempts": attempts,
+                "error": f"The recording could not be read: {error.strerror or error}.",
+                "retryable": False,
+                "updated_at": utc_now(),
+            },
+            outcome="failed",
+            detail={"attempts": attempts, "error": "read"},
+        )
 
     try:
         transcript = transcribe_wav(
             wav_bytes, api_key, model=model, transport=transport, timeout=timeout
         )
     except (PermanentError, TransientError) as error:
-        data = {
-            "status": "error",
-            "text": "",
-            "attempts": attempts,
-            "model": model,
-            "error": str(error),
-            "retryable": isinstance(error, TransientError),
-            "updated_at": utc_now(),
-        }
-        write_sidecars(wav_path, data)
-        return data
+        retryable = isinstance(error, TransientError)
+        return finish(
+            {
+                "status": "error",
+                "text": "",
+                "attempts": attempts,
+                "model": model,
+                "error": str(error),
+                "retryable": retryable,
+                "updated_at": utc_now(),
+            },
+            outcome="failed",
+            detail={"attempts": attempts, "retryable": retryable},
+        )
 
-    data = {
-        "status": "ok",
-        "text": transcript.text,
-        "attempts": attempts,
-        "model": transcript.model,
-        "usage": transcript.usage,
-        "seconds": round(time.monotonic() - started, 3),
-        "updated_at": utc_now(),
-    }
-    write_sidecars(wav_path, data)
-    return data
+    return finish(
+        {
+            "status": "ok",
+            "text": transcript.text,
+            "attempts": attempts,
+            "model": transcript.model,
+            "usage": transcript.usage,
+            "seconds": round(time.monotonic() - started, 3),
+            "updated_at": utc_now(),
+        },
+        detail={"attempts": attempts, "chars": len(transcript.text)},
+    )

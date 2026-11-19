@@ -6,11 +6,14 @@ touch a device.
 """
 
 import asyncio
+import base64
+import json
 import os
 import socket
+import wave
 import pytest
 
-from kindle.voice_bridge import bt_session
+from kindle.voice_bridge import bt_session, uploader
 
 
 class FakeSupervisor:
@@ -46,12 +49,16 @@ class FakeUploader:
 
     def __init__(self):
         self.calls = []
+        self.bodies = []
+        self.contexts = []
 
     def upload_recording(self, path, base_url, token, timeout=30,
-                         allow_insecure_lan=False):
+                         allow_insecure_lan=False, context_path=None):
         with open(path, "rb") as source:
             data = source.read()
         self.calls.append((path, base_url, token, len(data), allow_insecure_lan))
+        self.bodies.append(data)
+        self.contexts.append(context_path)
         return {"id": "recording-1"}
 
 
@@ -141,6 +148,9 @@ class ManualCapture:
         self.max_duration = max_duration
         self.max_duration_reached = False
         self.data = b""
+        self.cue_offset = None
+        self.cue_at = None
+        self.audio_event = asyncio.Event()
 
 
 class ManualController(FakeController):
@@ -238,6 +248,7 @@ def build_session(tmp_path, controller, experiment=None, idle_timeout=600,
         control_factory=control_factory if fake_control else None,
         state_path=str(tmp_path / "session.state"),
         command_path=str(tmp_path / "session.cmd"),
+        context_path=str(tmp_path / "context.json"),
     )
     return session, capture_local, uploader, experiment
 
@@ -748,3 +759,435 @@ def test_command_file_does_not_start_a_second_recording(tmp_path):
         return session.record_task
 
     assert asyncio.run(scenario()) is None
+
+
+def test_failed_upload_keeps_the_recording(tmp_path):
+    """A failed upload must not delete the only copy of the audio."""
+
+    async def scenario():
+        controller = FakeController()
+        session, capture_local, uploader, experiment = build_session(
+            tmp_path, controller)
+
+        def fail(path, base_url, token, timeout=30, allow_insecure_lan=False,
+                 context_path=None):
+            raise FakeUploader.UploadError("the network dropped")
+
+        uploader.upload_recording = fail
+        with pytest.raises(uploader.UploadError):
+            await session._upload_pcm(b"\x01\x00" * 100, 0.0, False, False, None)
+        return list(capture_local.written)
+
+    written = asyncio.run(scenario())
+    assert written, "the capture wrote no WAV"
+    kept = [path[:-len(".wav")] + ".failed.wav" for path in written]
+    assert any(os.path.exists(path) for path in kept), (
+        "the failed upload deleted the audio instead of keeping it")
+
+
+def test_begin_manual_recording_cancels_the_previous_answer_poll(tmp_path):
+    """A stale answer must not be published against the next recording."""
+
+    async def scenario():
+        controller = FakeController()
+        session, capture_local, uploader, experiment = build_session(
+            tmp_path, controller)
+
+        gate = asyncio.Event()
+
+        async def slow_fetch(recording_id):
+            await gate.wait()
+            session.last_answer = "the answer to the first recording"
+
+        session.fetch_answer = slow_fetch
+        session.start_answer_poll("rec-1")
+        await asyncio.sleep(0)
+        first = session.answer_task
+
+        session._begin_manual_recording()
+        assert first.cancelling() > 0, "the in-flight poll was not cancelled"
+        assert session.last_answer is None
+
+        # The recording task this started is not under test; stop it before it
+        # runs and then release the stale poll to prove it cannot publish.
+        if session.record_task is not None:
+            session.record_task.cancel()
+            await asyncio.gather(session.record_task, return_exceptions=True)
+        gate.set()
+        await asyncio.sleep(0.05)
+        assert session.last_answer is None
+
+    asyncio.run(scenario())
+
+
+# Context file, cue delay, and UTF-8 answers.
+
+
+class CueController(ManualController):
+    """A manual controller that trims at the cue like the real controller."""
+
+    def __init__(self, pre_cue, post_cue, cue_delay):
+        super().__init__()
+        self.pre_cue = pre_cue
+        self.post_cue = post_cue
+        self.cue_delay = cue_delay
+        self.uploaded = None
+
+    async def start_recording(self, max_duration=bt_session.MAX_MANUAL_RECORD_SECONDS):
+        self.start_recording_calls += 1
+        self.capture = ManualCapture(max_duration)
+        self.capture.data = bytearray(self.pre_cue)
+        if self.cue_delay:
+            await asyncio.sleep(self.cue_delay)
+            self.capture.cue_offset = bt_session.cue_trim_offset(
+                len(self.capture.data), FakeCaptureLocal.SAMPLE_RATE,
+                FakeCaptureLocal.SAMPLE_WIDTH)
+        return self.capture
+
+    async def stop_recording(self):
+        self.stop_recording_calls += 1
+        data = self.capture.data + self.post_cue
+        offset = self.capture.cue_offset or 0
+        self.uploaded = bytes(data[offset:])
+        return self.uploaded, None
+
+
+async def run_one_command_recording(session, controller, tmp_path, settle=0.1):
+    """Start one capture from the command file and stop it."""
+    session.controller = controller
+    command_path = tmp_path / "session.cmd"
+    command_path.write_text("start_recording\n", encoding="ascii")
+    session.poll_command_file()
+    while not session.recording:
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(settle)
+    reply, _stop_after = await session.dispatch("stop_recording")
+    return reply
+
+
+def test_the_context_file_is_read_once_and_removed(tmp_path, capsys):
+    payload = b'{"v": 1, "book": {"title": "Dune"}}'
+    controller = ManualController()
+    session, capture_local, fake_uploader, experiment = build_session(
+        tmp_path, controller)
+    context_file = tmp_path / "context.json"
+    context_file.write_bytes(payload)
+
+    async def scenario():
+        reply = await run_one_command_recording(session, controller, tmp_path)
+        return reply, session.context_bytes
+
+    reply, kept = asyncio.run(scenario())
+
+    assert reply.startswith("ok sent")
+    assert kept is None, "the context must not outlive the recording"
+    assert fake_uploader.contexts == [payload]
+    assert not context_file.exists()
+    out = capsys.readouterr().out
+    assert f"Context: {len(payload)} bytes." in out
+    assert payload.decode("ascii") not in out, "the payload reached the log"
+
+
+def test_a_missing_context_file_uploads_without_a_header(tmp_path, capsys):
+    controller = ManualController()
+    session, capture_local, fake_uploader, experiment = build_session(
+        tmp_path, controller)
+
+    async def scenario():
+        return await run_one_command_recording(session, controller, tmp_path)
+
+    reply = asyncio.run(scenario())
+
+    assert reply.startswith("ok sent")
+    assert fake_uploader.contexts == [None]
+    assert "Context: 0 bytes." in capsys.readouterr().out
+
+
+def test_an_unreadable_context_file_uploads_without_a_header(tmp_path):
+    controller = ManualController()
+    session, capture_local, fake_uploader, experiment = build_session(
+        tmp_path, controller)
+    # A directory in place of the file cannot be read.
+    os.makedirs(session.context_path)
+
+    async def scenario():
+        return await run_one_command_recording(session, controller, tmp_path)
+
+    reply = asyncio.run(scenario())
+
+    assert reply.startswith("ok sent")
+    assert fake_uploader.contexts == [None]
+
+
+def test_cue_trim_offset_keeps_a_pre_roll():
+    assert bt_session.cue_trim_offset(0, 8000, 2) == 0
+    assert bt_session.cue_trim_offset(1000, 8000, 2) == 0
+    # 0.2 s at 8 kHz mono 16-bit is 3200 bytes.
+    assert bt_session.cue_trim_offset(10000, 8000, 2) == 6800
+    assert bt_session.cue_trim_offset(10001, 8000, 2) == 6800
+
+
+def test_the_cue_delay_trims_the_start_of_the_upload(tmp_path):
+    pre_cue = b"\x00\x00" * 8000
+    post_cue = b"\x01\x00" * 4000
+    controller = CueController(pre_cue, post_cue, cue_delay=0.02)
+    session, capture_local, fake_uploader, experiment = build_session(
+        tmp_path, controller)
+
+    async def scenario():
+        return await run_one_command_recording(session, controller, tmp_path)
+
+    reply = asyncio.run(scenario())
+
+    preroll = bt_session.cue_trim_offset(len(pre_cue), 8000, 2)
+    assert preroll == len(pre_cue) - 3200
+    assert reply.startswith("ok sent")
+    assert controller.uploaded == pre_cue[preroll:] + post_cue
+    assert fake_uploader.bodies == [pre_cue[preroll:] + post_cue]
+
+
+def test_a_zero_cue_delay_keeps_the_whole_capture(tmp_path):
+    pre_cue = b"\x00\x00" * 8000
+    post_cue = b"\x01\x00" * 4000
+    controller = CueController(pre_cue, post_cue, cue_delay=0)
+    session, capture_local, fake_uploader, experiment = build_session(
+        tmp_path, controller)
+
+    async def scenario():
+        return await run_one_command_recording(session, controller, tmp_path)
+
+    reply = asyncio.run(scenario())
+
+    assert reply.startswith("ok sent")
+    assert controller.capture.cue_offset is None
+    assert fake_uploader.bodies == [pre_cue + post_cue]
+
+
+class SlowStartController(ManualController):
+    """A manual controller that spends time cueing before it returns."""
+
+    async def start_recording(self, max_duration=bt_session.MAX_MANUAL_RECORD_SECONDS):
+        self.start_recording_calls += 1
+        await asyncio.sleep(0.2)
+        self.capture = ManualCapture(max_duration)
+        return self.capture
+
+
+def test_the_capture_budget_starts_at_the_cue(tmp_path):
+    controller = SlowStartController()
+    session, capture_local, fake_uploader, experiment = build_session(
+        tmp_path, controller)
+
+    async def scenario():
+        session.controller = controller
+        command_path = tmp_path / "session.cmd"
+        command_path.write_text("start_recording\n", encoding="ascii")
+        session.poll_command_file()
+        # The cue is the moment the phase becomes recording.
+        while session.phase != "recording":
+            await asyncio.sleep(0.01)
+        state = await session.dispatch("state")
+        return state[0]
+
+    fields = asyncio.run(scenario()).split(" ")
+
+    assert fields[0:2] == ["ok", "recording"]
+    # The cue took 0.2 s, and none of it counts against the capture.
+    assert int(fields[2]) < 200
+    assert int(fields[3]) > 14800
+
+
+def test_delay_cue_offsets_and_logs_once(tmp_path, capsys):
+    capture_local = FakeCaptureLocal(str(tmp_path))
+    controller = bt_session.BumbleController(
+        capture_local, {}, "AA:BB:CC:DD:EE:FF", cue_delay=0.01)
+    capture = ManualCapture(15.0)
+    capture.data = bytearray(b"\x00\x00" * 8000)
+    capture.audio_event = asyncio.Event()
+
+    asyncio.run(controller._delay_cue(capture))
+
+    assert capture.cue_offset == len(capture.data) - 3200
+    assert capture.cue_at is not None
+    assert capsys.readouterr().out.count("Audio: cue delayed 0.01 s.") == 1
+
+
+def test_a_negative_cue_delay_is_rejected():
+    with pytest.raises(ValueError):
+        bt_session.BumbleController(
+            FakeCaptureLocal("."), {}, "AA:BB:CC:DD:EE:FF", cue_delay=-1)
+
+
+def test_context_file_and_cue_delay_defaults():
+    args = bt_session.build_parser().parse_args([
+        "--config", "upload.json",
+        "--authorize-bluetooth-handoff",
+        "--authorize-microphone-recording",
+        "--confirm-bluetooth-enabled-in-ui",
+    ])
+    assert args.context_file == "/tmp/voicebridge-context.json"
+    assert args.cue_delay == 2.0
+
+
+def test_a_negative_cue_delay_is_a_parser_error():
+    with pytest.raises(SystemExit):
+        bt_session.build_parser().parse_args([
+            "--config", "upload.json",
+            "--cue-delay", "-1",
+            "--authorize-bluetooth-handoff",
+            "--authorize-microphone-recording",
+            "--confirm-bluetooth-enabled-in-ui",
+        ])
+
+
+def test_answer_text_keeps_utf8_and_drops_controls():
+    answer = "Caf\u00e9 \u2014 \u201cquoted\u201d\nsecond\tline\x00\x07"
+    text = bt_session.answer_text(answer)
+    assert text == "Caf\u00e9 \u2014 \u201cquoted\u201d second line"
+    assert "\x00" not in text and "\x07" not in text
+    assert "\n" not in text
+
+
+def test_answer_text_truncates_by_characters():
+    text = bt_session.answer_text("\u00e9" * 600, limit=480)
+    assert len(text) == 480
+    assert text.endswith("...")
+    assert bt_session.answer_text("   ", limit=10) == "-"
+
+
+def test_the_answer_body_keeps_utf8(tmp_path):
+    controller = FakeController()
+    session, capture_local, fake_uploader, experiment = build_session(
+        tmp_path, controller)
+    session.last_answer = "L\u2019\u00e9t\u00e9 \u2014 \u201cvoil\u00e0\u201d"
+
+    body = session.answer_body()
+    assert body == "L\u2019\u00e9t\u00e9 \u2014 \u201cvoil\u00e0\u201d"
+
+    session.write_state_file()
+    lines = (tmp_path / "session.state").read_text(encoding="utf-8").splitlines()
+    assert lines[1] == "answer L\u2019\u00e9t\u00e9 \u2014 \u201cvoil\u00e0\u201d"
+
+
+def test_safe_text_stays_ascii():
+    text = bt_session.safe_text("Caf\u00e9 \u2014 ok")
+    assert text == "Caf ok"
+    assert all(ord(char) < 127 for char in text)
+
+
+def write_wav_file(path, samples=400):
+    with wave.open(str(path), "wb") as target:
+        target.setnchannels(1)
+        target.setsampwidth(2)
+        target.setframerate(8000)
+        target.writeframes(b"\x01\x00" * samples)
+
+
+class FakeResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def getcode(self):
+        return 201
+
+    def read(self, size=-1):
+        return json.dumps(self.payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class FakeOpener:
+    def __init__(self):
+        self.requests = []
+
+    def open(self, request, timeout=None):
+        self.requests.append(request)
+        return FakeResponse({"id": "rec-1"})
+
+
+def request_header(request, name):
+    for key, value in request.headers.items():
+        if key.lower() == name.lower():
+            return value
+    return None
+
+
+def open_fake_opener(monkeypatch):
+    opener = FakeOpener()
+    monkeypatch.setattr(uploader, "build_opener", lambda *args: opener)
+    return opener
+
+
+def test_upload_without_a_context_sends_no_header(tmp_path, monkeypatch):
+    path = tmp_path / "sample.wav"
+    write_wav_file(path)
+    opener = open_fake_opener(monkeypatch)
+
+    result = uploader.upload_recording(
+        str(path), "http://127.0.0.1:8000", "token")
+
+    assert result == {"id": "rec-1"}
+    request = opener.requests[0]
+    assert request_header(request, "X-KVB-Context") is None
+    assert request_header(request, "Content-Length") == str(path.stat().st_size)
+
+
+def test_upload_with_a_context_sends_the_header(tmp_path, monkeypatch):
+    path = tmp_path / "sample.wav"
+    write_wav_file(path)
+    context = '{"v": 1, "book": {"title": "Caf\u00e9"}}'.encode("utf-8")
+    context_path = tmp_path / "context.json"
+    context_path.write_bytes(context)
+    opener = open_fake_opener(monkeypatch)
+
+    uploader.upload_recording(
+        str(path), "http://127.0.0.1:8000", "token",
+        context_path=str(context_path))
+
+    request = opener.requests[0]
+    value = request_header(request, "X-KVB-Context")
+    assert "=" not in value
+    padded = value + "=" * (-len(value) % 4)
+    assert base64.urlsafe_b64decode(padded.encode("ascii")) == context
+    # The body and its length are unchanged by the header.
+    assert request_header(request, "Content-Length") == str(path.stat().st_size)
+    assert request.data == path.read_bytes()
+
+
+def test_upload_with_an_oversized_context_is_rejected_before_sending(
+        tmp_path, monkeypatch):
+    path = tmp_path / "sample.wav"
+    write_wav_file(path)
+    context_path = tmp_path / "context.json"
+    context_path.write_bytes(b"x" * 4000)
+    opener = open_fake_opener(monkeypatch)
+
+    with pytest.raises(uploader.UploadError):
+        uploader.upload_recording(
+            str(path), "http://127.0.0.1:8000", "token",
+            context_path=str(context_path))
+
+    assert opener.requests == []
+
+
+def test_encode_context_limits_the_encoded_size():
+    # 3072 bytes encode to exactly 4096 characters without padding.
+    assert len(uploader.encode_context(b"x" * 3072)) == 4096
+    with pytest.raises(uploader.UploadError):
+        uploader.encode_context(b"x" * 3073)
+
+
+def test_upload_ignores_a_missing_context_file(tmp_path, monkeypatch):
+    path = tmp_path / "sample.wav"
+    write_wav_file(path)
+    opener = open_fake_opener(monkeypatch)
+
+    uploader.upload_recording(
+        str(path), "http://127.0.0.1:8000", "token",
+        context_path=str(tmp_path / "absent.json"))
+
+    assert request_header(opener.requests[0], "X-KVB-Context") is None

@@ -7,7 +7,7 @@
 
 Implement the first milestone defined in [`PLAN.md`](PLAN.md): capture a short Bluetooth-headset microphone recording **on the Kindle PW4** and send it over Wi-Fi to a receiver running on the Windows laptop. The initial control interface is a KOReader plugin, with capture independent of the reader. The laptop must be awake and running the receiver for this phase. Design the receiver and upload contract so the application can later be deployed remotely without requiring the laptop during normal use.
 
-**This is a handoff document, not an implementation.** The existing source, test, configuration and supplementary documentation files in the scaffold are intentionally empty placeholders; empty JSON and TOML files are not usable configurations. Remote provider selection and all hardware-dependent details remain open.
+**This is a handoff document, not an implementation.** It records the plan as it was written, before any code existed. The scaffold was empty at the start; this section describes the intended layout, not the current state of the repository. Remote provider selection and all hardware-dependent details remain open.
 
 ### Non-negotiable boundaries
 
@@ -27,8 +27,8 @@ The existing directories and files indicate intended responsibilities, not manda
 kindle-voice-bridge/
 ├── PLAN.md                        # approved goals and safety gates
 ├── agent-plan.md                  # this handoff
-├── README.md                      # setup and operation; initially blank
-├── .gitignore, pyproject.toml     # initially blank
+├── README.md                      # setup and operation
+├── .gitignore, pyproject.toml     # ignore rules and packaging
 ├── docs/                          # protocol, recovery, hardware evidence
 ├── kindle/voice_bridge/           # capture, lifecycle, control and uploader
 ├── koreader/voicebridge.koplugin/ # initial reader controls
@@ -95,7 +95,7 @@ Provide the user with local setup/start/stop instructions, desktop and LAN test 
 
 ## Research references
 
-- [`PLAN.md`](PLAN.md) and [`../kindle-bt-mic-streaming-research.md`](../kindle-bt-mic-streaming-research.md) — the latter includes older streaming and deployment assumptions that are not the current plan
+- [`PLAN.md`](PLAN.md) and [`docs/research/bluetooth-mic-feasibility.md`](docs/research/bluetooth-mic-feasibility.md) — the latter includes older streaming and deployment assumptions that are not the current plan
 - [SpiderCat](https://github.com/KindleModding/SpiderCat), [KindleModding: what's next](https://kindlemodding.org/jailbreaking/whats-next/) and [Jobman](https://kindlemodding.org/jailbreaking/whats-next/jailbreaking-manager/)
 - [kindle-hid-passthrough](https://github.com/zampierilucas/kindle-hid-passthrough) — controller takeover reference, not audio capture
 - [kindle8-offline-home](https://github.com/yzgpk2002/kindle8-offline-home) — model-specific HFP reference and its licence/dependency notes
