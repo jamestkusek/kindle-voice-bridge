@@ -67,31 +67,33 @@ Basically, the Capture Supervisor takes over the Bluetooth chip on the Kindle, o
 
 ## Setup
 
-### Preliminary: Install the runtimes on the Kindle
+### Preliminary: Put Python on the Kindle (one time)
 
-This is a one-time step. The Kindle has no system Python, so it needs a portable
-runtime and the Bumble Bluetooth stack.
+The Kindle has no Python. The plugin and the Bluetooth stack need Python. Do this
+step one time.
 
-1. Stage the two bundles on the host:
-   - `build/python31117/` — portable CPython 3.11.17 (ARMv7, glibc 2.20).
-   - `build/bumble-kindle/` — Bumble 0.0.236 and its pure-Python dependencies.
-   The exact package versions are pinned in
-   [docs/bumble-bundle-manifest.txt](docs/bumble-bundle-manifest.txt).
-2. Connect the Kindle over USB and run:
+1. Download [Python for the Kindle](https://github.com/astral-sh/python-build-standalone/releases/download/20261021/cpython-3.11.17%2B20261021-armv7-unknown-linux-gnueabihf-install_only_stripped.tar.gz)
+   (27 MB). Extract it into the project's `build` folder. Rename the extracted
+   `python` folder to `python31117`.
+2. Download [bumble-kindle.zip](https://github.com/jamestkusek/kindle-voice-bridge/releases/download/runtime-v1/bumble-kindle.zip)
+   (1.2 MB). Extract it into `build`. This step writes the Bluetooth stack to
+   `build\bumble-kindle`.
+3. Connect the Kindle to the PC with the USB cable. Find the Kindle drive letter
+   in File Explorer. The letter is usually `D:`.
+4. Run this command with your drive letter:
 
    ```powershell
    .\tools\kvb.ps1 install-runtimes -KindleRoot D:\
    ```
 
-   The command checks both bundles, verifies the Bumble bundle, and copies them
-   to `/mnt/us/kindle-voice-bridge/`. It skips runtimes that are already
-   installed. Use `-Force` to replace them, or `-BundleRoot` if the bundles are
-   not under `build\`.
-3. Pair the headset in the Kindle's Bluetooth settings and enable Bluetooth.
-   Put the Kindle on the same Wi-Fi network as the laptop.
+The command copies both folders to the Kindle. Later runs skip the folders that
+are already there. Add `-Force` to replace them.
 
-The command copies the staged bundles. It does not download them. The `deploy`
-command copies the application files only; it does not copy either runtime.
+Run the `deploy` command after this step. `deploy` copies the application files
+to the Kindle.
+
+Pair the headset in the Kindle's Bluetooth settings and enable Bluetooth. Put the
+Kindle on the same Wi-Fi network as the laptop.
 
 ### 1. Jailbreak the Kindle and install KOReader
 

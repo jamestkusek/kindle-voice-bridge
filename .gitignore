@@ -109,3 +109,7 @@ $RECYCLE.BIN/
 *~
 .idea/
 .vscode/
+
+# Working notes for finished work; files stay on disk, out of the repo
+PLAN.md
+agent-plan.md
