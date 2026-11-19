@@ -22,9 +22,10 @@ There is one crucial drawback to this. Typing on a Kindle keyboard sucks. It’s
 
 1. Allows the user to ask questions via a plugin in KOReader
 2. The Kindle uploads the audio file over Wi-Fi to the receiver
-3. The receiver transcribes the audio with a model of your choosing (BYOK), processes a response using an LLM (BYOK, and returns a
-   short answer.
+3. The receiver transcribes the audio with a STT model, processes a response using an LLM , and returns a short answer.
 4. A local dashboard lists recordings, transcripts and answers.
+
+For now, you can connect models through OpenRouter using an API key.
 
 A /debug page gives insight into the full pipeline and allows tracing of questions and answers.
 Here you can also choose API keys for the transcription and answer models and edit their system prompt.
