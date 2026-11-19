@@ -28,8 +28,8 @@ interface between the two models.
 - Everything! After all, if you want to develop a working prototype in such a short amount of time, you don't have the time to learn Lua or how to load CPython onto a Kindle.
 
 ## Usage Report
-**Terra** - 72.9M tokens with total cost of $9.66
+**Terra** - 72.9M tokens with total API cost of $9.66
 
-**Deepseek V4.1** -  459.4M with a total cost of $21.38
+**Deepseek V4.1** -  459.4M with a total API cost of $21.38
 
 
